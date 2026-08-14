@@ -62,6 +62,7 @@ src/marketdata/
 │   ├── base.py           MarketDataProvider abstraction
 │   ├── errors.py         Transient vs permanent failure classification
 │   ├── retry.py          Retry policy and executor
+│   ├── rate_limit.py     Outbound request pacing
 │   └── dukascopy.py      Dukascopy implementation
 ├── normalization/
 │   └── timestamps.py     UTC normalization
@@ -169,6 +170,58 @@ so a chunk that exhausted its retries reads differently from one that failed
 on the first permanent error. That history survives a restart and accumulates
 across runs.
 
+## Rate limiting
+
+Every outbound provider request passes a limiter that spaces requests at
+least `1 / rate` seconds apart. The rate is the only knob — one setting
+expressed two ways is easier to reason about than two that can disagree —
+and the spacing is strict, so an idle period does not bank a burst that all
+arrives at once.
+
+| Property | Value |
+| --- | --- |
+| Default | **2 requests/second** (a 0.5s minimum interval) |
+| Configuration | `--rate-limit REQUESTS_PER_SECOND` |
+| Unlimited setting | none; the rate must be positive and finite |
+| Clock | monotonic, so a system clock change cannot release a burst |
+
+The default is deliberately conservative. Dukascopy's free endpoint
+publishes no limit, and a multi-year one-minute download runs to hundreds of
+requests per symbol once pagination is counted; two per second keeps that in
+the tens of minutes while staying gentle enough that an unpublished limit is
+unlikely to be hit. Raise it only against a provider whose limits you know.
+
+The limiter is safe to share between callers. The slot for the next request
+is reserved under a lock and the waiting happens outside it, so concurrent
+callers get distinct, evenly spaced slots and wait in parallel rather than
+queueing behind a held lock.
+
+### How it works with retries
+
+Rate limiting and retry/backoff solve different problems and both apply.
+Backoff decides *when it is worth trying again* after a failure; the limiter
+decides *how fast requests may leave* at all.
+
+```text
+request → rate limiter → HTTP request
+                            │
+                     failure? ── no → done
+                            │
+                           yes
+                            ↓
+                     retry backoff
+                            ↓
+                     rate limiter        ← a retry queues like any request
+                            ↓
+                       next request
+```
+
+The limiter sits inside the retried operation, so a retry takes a slot like
+any other request. Letting retries skip the queue would lift the limit
+exactly when the provider is already struggling. When backoff has already
+waited longer than the interval — after a `Retry-After`, for instance — the
+limiter adds nothing on top rather than waiting a second time.
+
 ## Partition merging
 
 Writing a month **merges** with whatever that partition already holds instead
@@ -219,6 +272,7 @@ UTC. The range is half-open: `--end` is exclusive.
 | `--manifest-root` | `data/manifests` | Manifest root |
 | `--quality-root` | `data/quality` | Quality report root |
 | `--checkpoint-root` | `data/checkpoints` | Resume checkpoint root |
+| `--rate-limit` | `2` | Maximum provider requests per second, applied to every request including retries |
 | `--retry-attempts` | `4` | Total attempts per provider request, including the first; `1` disables retries |
 | `--retry-backoff` | `1.0` | Seconds before the first retry, doubling thereafter |
 | `--retry-max-backoff` | `60.0` | Upper bound on the wait between retries |
@@ -227,7 +281,8 @@ UTC. The range is half-open: `--end` is exclusive.
 
 The command prints the provider, symbol, timeframe, calendar, requested and
 actual ranges, chunk progress, row counts at each stage, the retries spent,
-the quality status and the path of every artifact it wrote. It exits `1` when a chunk failed,
+the active rate limit and time spent throttled, the quality status and the
+path of every artifact it wrote. It exits `1` when a chunk failed,
 listing each failure, and rerunning the same command retries only those
 chunks.
 
@@ -289,6 +344,8 @@ to restrict the read; the filter is pushed into the scan.
   "chunks_total": 1,
   "chunks_completed": 1,
   "chunks_failed": 0,
+  "provider_retries": 0,
+  "rate_limit_requests_per_second": 2.0,
   "status": "ok",
   "violations": [],
   "violations_truncated": false,
@@ -379,15 +436,16 @@ For every stored dataset:
   memory. A seven-year one-minute range is a few million values.
 - A chunk is retried whole. There is no partial-chunk recovery: a chunk whose
   retries are exhausted is re-fetched from its start on the next run.
-- There is no rate limiting. Retries back off after a 429, but nothing paces
-  requests in the first place, so a multi-year run against a free endpoint is
-  not yet advisable.
+- The rate limit is per process. Two downloads started separately do not
+  share a limiter, so running several at once multiplies the request rate.
+- Pacing is uniform: there is no adaptive slowdown that lowers the rate after
+  a provider signals overload beyond honouring `Retry-After` on that request.
 
 ## Roadmap
 
 See [`planner.md`](planner.md) for the full phase breakdown, per-phase
 acceptance criteria, current blockers and the next milestone. In short: the
-ingestion path through resumable chunked downloads, retries and error
-classification is complete; rate limiting is next; live provider access is
-blocked by the development environment's egress policy; dataset acquisition, backtesting,
+ingestion path through resumable chunked downloads, retries, error
+classification and rate limiting is complete; live provider verification is
+next and is blocked by the development environment's egress policy; dataset acquisition, backtesting,
 analytics and the UI are planned and not started.

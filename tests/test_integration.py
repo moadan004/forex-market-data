@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+from conftest import instant_limiter
 
 from marketdata.cli import main
 from marketdata.providers.dukascopy import DukascopyProvider
@@ -103,6 +104,7 @@ def provider_factory(api):
         return DukascopyProvider(
             client=httpx.Client(transport=httpx.MockTransport(api.handler)),
             retry_policy=INSTANT_RETRIES,
+            rate_limiter=instant_limiter(),
         )
 
     return factory
@@ -304,6 +306,7 @@ def test_a_failed_chunk_is_recovered_by_rerunning(tmp_path, api, capsys):
         return DukascopyProvider(
             client=httpx.Client(transport=httpx.MockTransport(handler)),
             retry_policy=INSTANT_RETRIES,
+            rate_limiter=instant_limiter(),
         )
 
     assert download(tmp_path, provider_factory, "--chunk-size", "30min") == 1

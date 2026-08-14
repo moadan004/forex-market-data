@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 
 import httpx
 import pytest
+from conftest import instant_limiter
 
 from marketdata.models.candle import Candle
 from marketdata.providers.dukascopy import DukascopyError, DukascopyProvider
@@ -62,7 +63,7 @@ def test_symbol_resolution_and_fetch():
 
     client = make_client(handler)
 
-    with DukascopyProvider(client=client) as provider:
+    with DukascopyProvider(client=client, rate_limiter=instant_limiter()) as provider:
         candles = provider.fetch_candles(
             "EUR/USD",
             datetime(2026, 8, 14, 12, 0, tzinfo=UTC),
@@ -93,7 +94,7 @@ def test_empty_response_returns_no_candles():
 
     client = make_client(handler)
 
-    with DukascopyProvider(client=client) as provider:
+    with DukascopyProvider(client=client, rate_limiter=instant_limiter()) as provider:
         candles = provider.fetch_candles(
             "EUR/USD",
             datetime(2026, 8, 14, 12, 0, tzinfo=UTC),
@@ -113,7 +114,7 @@ def test_naive_datetime_is_rejected():
     client = make_client(handler)
 
     with (
-        DukascopyProvider(client=client) as provider,
+        DukascopyProvider(client=client, rate_limiter=instant_limiter()) as provider,
         pytest.raises(ValueError, match="timezone-aware"),
     ):
         provider.fetch_candles(
@@ -130,7 +131,7 @@ def test_invalid_range_is_rejected():
     client = make_client(handler)
 
     with (
-        DukascopyProvider(client=client) as provider,
+        DukascopyProvider(client=client, rate_limiter=instant_limiter()) as provider,
         pytest.raises(ValueError, match="before"),
     ):
         provider.fetch_candles(
@@ -150,7 +151,7 @@ def test_unknown_symbol_is_rejected():
     client = make_client(handler)
 
     with (
-        DukascopyProvider(client=client) as provider,
+        DukascopyProvider(client=client, rate_limiter=instant_limiter()) as provider,
         pytest.raises(DukascopyError, match="Unsupported"),
     ):
         provider.fetch_candles(

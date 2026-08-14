@@ -77,6 +77,8 @@ class DownloadResult:
     chunks_failed: int
     chunks_skipped: int
     retries: int
+    rate_limit: str
+    throttled_seconds: float
     failures: list[str]
     files: list[Path]
     manifest: Path
@@ -303,6 +305,10 @@ class DownloadPipeline:
         violations = [
             violation for outcome in outcomes for violation in outcome.violations
         ]
+
+        # Providers are not required to throttle, so ask rather than assume.
+        rate_limit = getattr(self.provider, "rate_limit", None)
+        limiter_stats = getattr(self.provider, "rate_limit_stats", None)
         files = sorted({path for outcome in outcomes for path in outcome.files})
 
         report = build_quality_report(
@@ -320,6 +326,10 @@ class DownloadPipeline:
             chunks_total=len(checkpoint.chunks),
             chunks_completed=checkpoint.completed_chunks,
             chunks_failed=checkpoint.failed_chunks,
+            rate_limit_requests_per_second=(
+                rate_limit.requests_per_second if rate_limit else None
+            ),
+            provider_retries=sum(outcome.retries for outcome in outcomes),
         )
 
         slug = self._dataset_slug(timeframe, start, end)
@@ -366,6 +376,10 @@ class DownloadPipeline:
             chunks_failed=report.chunks_failed,
             chunks_skipped=skipped,
             retries=sum(outcome.retries for outcome in outcomes),
+            rate_limit=rate_limit.describe() if rate_limit else "none",
+            throttled_seconds=(
+                limiter_stats.total_wait_seconds if limiter_stats else 0.0
+            ),
             failures=[
                 f"chunk {outcome.chunk.index} "
                 f"({outcome.chunk.start:%Y-%m-%dT%H:%M:%SZ} -> "

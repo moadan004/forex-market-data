@@ -10,6 +10,7 @@ from marketdata.downloader.pipeline import DownloadPipeline, DownloadResult
 from marketdata.providers.base import MarketDataProvider
 from marketdata.providers.dukascopy import DukascopyProvider
 from marketdata.providers.errors import ProviderError
+from marketdata.providers.rate_limit import DEFAULT_REQUESTS_PER_SECOND, RateLimit
 from marketdata.providers.retry import (
     DEFAULT_ATTEMPTS,
     DEFAULT_BACKOFF_SECONDS,
@@ -128,6 +129,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Root directory for resume checkpoints. Default: data/checkpoints.",
     )
     download.add_argument(
+        "--rate-limit",
+        type=float,
+        default=DEFAULT_REQUESTS_PER_SECOND,
+        metavar="REQUESTS_PER_SECOND",
+        help=(
+            "Maximum outbound provider requests per second, applied to every "
+            "request including retries. Equivalent to a minimum interval of "
+            "1/RATE seconds between requests. There is no unlimited setting. "
+            f"Default: {DEFAULT_REQUESTS_PER_SECOND:g}."
+        ),
+    )
+    download.add_argument(
         "--retry-attempts",
         type=int,
         default=DEFAULT_ATTEMPTS,
@@ -207,6 +220,8 @@ def format_summary(result: DownloadResult) -> str:
         f"Invalid rows:      {result.invalid_count}",
         f"Out of range rows: {result.out_of_range_count}",
         f"Provider retries:  {result.retries}",
+        f"Rate limit:        {result.rate_limit}",
+        f"Throttled:         {result.throttled_seconds:.1f}s",
         f"Missing candles:   {report.missing_candles}",
         f"Market closures:   {len(report.market_closed_intervals)}",
         f"Quality status:    {report.status.value}",
@@ -229,6 +244,11 @@ def format_summary(result: DownloadResult) -> str:
     return "\n".join(lines)
 
 
+def rate_limit_from_args(args: argparse.Namespace) -> RateLimit:
+    """Build the rate limit the provider should honour."""
+    return RateLimit(requests_per_second=args.rate_limit)
+
+
 def retry_policy_from_args(args: argparse.Namespace) -> RetryPolicy:
     """Build the retry policy the provider should use."""
     return RetryPolicy(
@@ -246,7 +266,10 @@ def run_download(
     if provider_factory is None:
 
         def provider_factory() -> MarketDataProvider:
-            return DukascopyProvider(retry_policy=retry_policy_from_args(args))
+            return DukascopyProvider(
+                retry_policy=retry_policy_from_args(args),
+                rate_limit=rate_limit_from_args(args),
+            )
 
     provider = provider_factory()
 

@@ -58,6 +58,8 @@ class QualityReport(BaseModel):
     chunks_total: int
     chunks_completed: int
     chunks_failed: int
+    provider_retries: int
+    rate_limit_requests_per_second: float | None
     status: QualityStatus
     violations: list[CandleViolation]
     violations_truncated: bool
@@ -105,6 +107,8 @@ def build_quality_report(
     chunks_total: int = 1,
     chunks_completed: int = 1,
     chunks_failed: int = 0,
+    provider_retries: int = 0,
+    rate_limit_requests_per_second: float | None = None,
 ) -> QualityReport:
     """
     Build the quality report for one completed pipeline run.
@@ -156,6 +160,8 @@ def build_quality_report(
         chunks_total=chunks_total,
         chunks_completed=chunks_completed,
         chunks_failed=chunks_failed,
+        provider_retries=provider_retries,
+        rate_limit_requests_per_second=rate_limit_requests_per_second,
         status=_status(
             retained_rows=len(timestamps),
             invalid_rows=len(violations),

@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 import httpx
 import pytest
+from conftest import instant_limiter
 
 from marketdata.providers.dukascopy import DukascopyError, DukascopyProvider
 from marketdata.providers.errors import (
@@ -56,6 +57,7 @@ def make_provider(handler, *, policy: RetryPolicy = INSTANT) -> DukascopyProvide
     return DukascopyProvider(
         client=httpx.Client(transport=httpx.MockTransport(handler)),
         retry_policy=policy,
+        rate_limiter=instant_limiter(),
     )
 
 

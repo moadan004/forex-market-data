@@ -91,9 +91,15 @@ class RetryExecutor:
     fails immediately instead of after every attempt.
     """
 
-    def __init__(self, policy: RetryPolicy | None = None) -> None:
+    def __init__(
+        self,
+        policy: RetryPolicy | None = None,
+        *,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
         self.policy = policy or RetryPolicy()
         self.stats = RetryStats()
+        self._sleep = sleep
 
     def backoff_for(self, attempt: int, retry_after: float | None = None) -> float:
         """
@@ -133,12 +139,18 @@ class RetryExecutor:
 
     def __call__(self, operation: Callable[[], T]) -> T:
         """Run ``operation``, retrying transient failures."""
+        options: dict[str, object] = {}
+
+        if self._sleep is not None:
+            options["sleep"] = self._sleep
+
         retrying = Retrying(
             stop=stop_after_attempt(self.policy.attempts),
             wait=self._wait,
             retry=retry_if_exception_type(TransientProviderError),
             before_sleep=self._before_sleep,
             reraise=True,
+            **options,
         )
 
         return retrying(operation)
