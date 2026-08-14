@@ -146,6 +146,8 @@ def test_download_command_produces_a_readable_dataset(
             str(tmp_path / "manifests"),
             "--quality-root",
             str(tmp_path / "quality"),
+            "--checkpoint-root",
+            str(tmp_path / "checkpoints"),
         ],
         provider_factory=provider_factory,
     )
@@ -198,6 +200,8 @@ def test_download_command_records_the_run(tmp_path, provider_factory):
             str(tmp_path / "manifests"),
             "--quality-root",
             str(tmp_path / "quality"),
+            "--checkpoint-root",
+            str(tmp_path / "checkpoints"),
         ],
         provider_factory=provider_factory,
     )
@@ -218,9 +222,105 @@ def test_download_command_records_the_run(tmp_path, provider_factory):
     assert manifest["quality_report"] == str(report_path)
 
     assert report["downloaded_rows"] == 60
-    assert report["final_rows"] == 60
+    assert report["retained_rows"] == 60
     assert report["expected_rows"] == 60
     assert report["duplicates_removed"] == 0
     assert report["invalid_rows"] == 0
     assert report["missing_intervals"] == []
     assert report["status"] == "ok"
+
+
+def download(tmp_path, provider_factory, *extra):
+    return main(
+        [
+            "download",
+            "--symbol",
+            "EUR/USD",
+            "--start",
+            "2026-08-14T12:00:00Z",
+            "--end",
+            "2026-08-14T13:00:00Z",
+            "--data-root",
+            str(tmp_path / "processed"),
+            "--manifest-root",
+            str(tmp_path / "manifests"),
+            "--quality-root",
+            str(tmp_path / "quality"),
+            "--checkpoint-root",
+            str(tmp_path / "checkpoints"),
+            *extra,
+        ],
+        provider_factory=provider_factory,
+    )
+
+
+def test_chunked_download_covers_the_range_once(tmp_path, provider_factory, api):
+    exit_code = download(tmp_path, provider_factory, "--chunk-size", "30min")
+
+    assert exit_code == 0
+
+    windows = [
+        (int(params["start"]), int(params["end"])) for params in api.price_requests
+    ]
+
+    # Each chunk opens with a request for its own window, and pagination
+    # inside a chunk never reaches outside the requested range.
+    assert windows[0] == (to_ms(START), to_ms(START + MINUTE * 30))
+    assert (to_ms(START + MINUTE * 30), to_ms(END)) in windows
+    assert all(
+        to_ms(START) <= window[0] < window[1] <= to_ms(END) for window in windows
+    )
+
+    storage = ParquetStorage(tmp_path / "processed")
+    timestamps = storage.read_timestamps(symbol="EUR/USD", timeframe="1min")
+
+    assert len(timestamps) == 60
+    assert len(set(timestamps)) == 60
+    assert timestamps[0] == START
+    assert timestamps[-1] == END - MINUTE
+
+
+def test_a_failed_chunk_is_recovered_by_rerunning(tmp_path, api, capsys):
+    failing = {"active": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+
+        if (
+            failing["active"]
+            and params["path"] == "api/historicalPrices"
+            and int(params["start"]) >= to_ms(START + MINUTE * 30)
+        ):
+            return httpx.Response(503)
+
+        return api.handler(request)
+
+    def provider_factory() -> DukascopyProvider:
+        return DukascopyProvider(
+            client=httpx.Client(transport=httpx.MockTransport(handler))
+        )
+
+    assert download(tmp_path, provider_factory, "--chunk-size", "30min") == 1
+
+    output = capsys.readouterr().out
+
+    assert "Quality status:    failed" in output
+    assert "Failed chunks:" in output
+
+    storage = ParquetStorage(tmp_path / "processed")
+
+    assert len(storage.read_timestamps(symbol="EUR/USD", timeframe="1min")) == 30
+
+    failing["active"] = False
+
+    assert download(tmp_path, provider_factory, "--chunk-size", "30min") == 0
+
+    output = capsys.readouterr().out
+
+    assert "1 already done" in output
+    assert "Quality status:    ok" in output
+
+    timestamps = storage.read_timestamps(symbol="EUR/USD", timeframe="1min")
+
+    assert len(timestamps) == 60
+    assert len(set(timestamps)) == 60

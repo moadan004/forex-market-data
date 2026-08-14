@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from datetime import datetime
 from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 
@@ -8,6 +10,7 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from marketdata.models.candle import Candle
+from marketdata.validation.candles import merge_candles
 
 PRICE_SCALE = 8
 PRICE_PRECISION = 18
@@ -103,8 +106,19 @@ class ParquetStorage:
         *,
         symbol: str,
         timeframe: str,
+        merge: bool = True,
     ) -> list[Path]:
-        """Write candles partitioned by symbol, timeframe, year and month."""
+        """
+        Write candles partitioned by symbol, timeframe, year and month.
+
+        An existing partition is merged with rather than replaced: chunked
+        downloads write the same month from several requests, and a resumed
+        or overlapping run must not discard what earlier runs already stored.
+        New candles win over stored ones for the same timestamp, so
+        re-downloading a range corrects it instead of duplicating it.
+
+        Pass ``merge=False`` to replace a partition outright.
+        """
         if not candles:
             return []
 
@@ -124,23 +138,48 @@ class ParquetStorage:
 
             path = directory / "candles.parquet"
 
-            pq.write_table(candles_to_table(group), path)
+            rows = group
+
+            if merge and path.exists():
+                rows = merge_candles(table_to_candles(pq.read_table(path)), group)
+
+            self._write_partition(path, candles_to_table(rows))
 
             written.append(path)
 
         return written
+
+    @staticmethod
+    def _write_partition(path: Path, table: pa.Table) -> None:
+        """
+        Replace a partition file atomically.
+
+        Writing in place would leave a merged partition truncated if the
+        process died mid-write, losing data that was already safely stored.
+        """
+        temporary = path.with_name(f"{path.name}.tmp")
+
+        try:
+            pq.write_table(table, temporary)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def read_table(
         self,
         *,
         symbol: str,
         timeframe: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
     ) -> pa.Table:
         """
         Read a stored dataset back with PyArrow.
 
-        Returns an empty table with the canonical schema when nothing has been
-        written for the symbol yet.
+        ``start`` and ``end`` restrict the result to the half-open range
+        ``[start, end)``; the filter is pushed into the scan, so a range read
+        does not materialize the whole dataset. Returns an empty table with
+        the canonical schema when nothing has been written for the symbol yet.
         """
         directory = self.dataset_path(symbol, timeframe)
 
@@ -153,7 +192,20 @@ class ParquetStorage:
             partitioning="hive",
         )
 
-        table = dataset.to_table()
+        conditions = []
+
+        if start is not None:
+            conditions.append(ds.field("timestamp") >= start)
+
+        if end is not None:
+            conditions.append(ds.field("timestamp") < end)
+
+        expression = None
+
+        for condition in conditions:
+            expression = condition if expression is None else expression & condition
+
+        table = dataset.to_table(filter=expression)
 
         if table.num_rows == 0:
             return CANDLE_SCHEMA.empty_table()
@@ -165,6 +217,38 @@ class ParquetStorage:
         *,
         symbol: str,
         timeframe: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
     ) -> list[Candle]:
         """Read a stored dataset back as canonical candles."""
-        return table_to_candles(self.read_table(symbol=symbol, timeframe=timeframe))
+        return table_to_candles(
+            self.read_table(
+                symbol=symbol,
+                timeframe=timeframe,
+                start=start,
+                end=end,
+            )
+        )
+
+    def read_timestamps(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> list[datetime]:
+        """
+        Read only the timestamps of a stored dataset, in order.
+
+        Quality reporting needs the coverage of a dataset rather than its
+        prices, and a multi-year range holds millions of rows.
+        """
+        table = self.read_table(
+            symbol=symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+        )
+
+        return table.column("timestamp").to_pylist()

@@ -138,6 +138,20 @@ def deduplicate_candles(candles: list[Candle]) -> list[Candle]:
     )
 
 
+def merge_candles(
+    existing: list[Candle],
+    incoming: list[Candle],
+) -> list[Candle]:
+    """
+    Combine two candle sets, keeping one row per symbol and timestamp.
+
+    ``incoming`` wins on conflict, so re-downloading a range corrects what
+    was stored for it rather than duplicating it. The result is
+    chronological and does not depend on the order within either input.
+    """
+    return deduplicate_candles([*existing, *incoming])
+
+
 def duplicate_timestamps(candles: list[Candle]) -> dict[object, int]:
     """Return timestamps occurring more than once."""
     counts = Counter(candle.timestamp for candle in candles)

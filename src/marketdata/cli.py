@@ -4,6 +4,8 @@ import argparse
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 
+from marketdata.calendar import CALENDARS, get_calendar
+from marketdata.downloader.chunks import ChunkSize, parse_chunk_size
 from marketdata.downloader.pipeline import DownloadPipeline, DownloadResult
 from marketdata.providers.base import MarketDataProvider
 from marketdata.providers.dukascopy import DukascopyError, DukascopyProvider
@@ -24,6 +26,14 @@ def parse_datetime(value: str) -> datetime:
         raise argparse.ArgumentTypeError("datetime must include timezone information")
 
     return result.astimezone(UTC)
+
+
+def chunk_size(value: str) -> ChunkSize:
+    """Parse a chunk size, reporting failures as an argument error."""
+    try:
+        return parse_chunk_size(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -65,8 +75,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Dukascopy timeframe. Default: 1min.",
     )
     download.add_argument(
+        "--chunk-size",
+        default="1month",
+        type=chunk_size,
+        help=(
+            "Size of each provider request, for example 1month, 3months, "
+            "7d, 12h or 30min. Default: 1month."
+        ),
+    )
+    download.add_argument(
+        "--calendar",
+        default="forex",
+        choices=sorted(CALENDARS),
+        help=(
+            "Trading calendar used to tell an expected candle from a market "
+            "closure. Default: forex."
+        ),
+    )
+    download.add_argument(
+        "--no-resume",
+        action="store_false",
+        dest="resume",
+        help="Ignore saved progress and download every chunk again.",
+    )
+    download.add_argument(
+        "--data-root",
         "--output-root",
         default="data/processed",
+        dest="data_root",
         help="Root directory for Parquet output. Default: data/processed.",
     )
     download.add_argument(
@@ -80,9 +116,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Root directory for quality reports. Default: data/quality.",
     )
     download.add_argument(
+        "--checkpoint-root",
+        default="data/checkpoints",
+        help="Root directory for resume checkpoints. Default: data/checkpoints.",
+    )
+    download.add_argument(
         "--strict",
         action="store_true",
-        help="Fail instead of dropping candles that break OHLC invariants.",
+        help=(
+            "Stop on the first chunk that fails or contains candles breaking "
+            "OHLC invariants, instead of recording it and continuing."
+        ),
     )
     download.add_argument(
         "--json",
@@ -109,6 +153,7 @@ def format_summary(result: DownloadResult) -> str:
         f"Provider:          {result.provider}",
         f"Symbol:            {result.symbol}",
         f"Timeframe:         {result.timeframe}",
+        f"Calendar:          {report.calendar}",
         (
             f"Requested range:   {_format_timestamp(result.requested_start)}"
             f" -> {_format_timestamp(result.requested_end)}"
@@ -117,12 +162,18 @@ def format_summary(result: DownloadResult) -> str:
             f"Actual range:      {_format_timestamp(result.actual_start)}"
             f" -> {_format_timestamp(result.actual_end)}"
         ),
+        (
+            f"Chunks:            {result.chunks_completed}/{result.chunks_total}"
+            f" completed, {result.chunks_failed} failed,"
+            f" {result.chunks_skipped} already done"
+        ),
         f"Rows downloaded:   {result.downloaded_count}",
-        f"Rows retained:     {result.final_count}",
+        f"Rows retained:     {result.retained_count}",
         f"Duplicates:        {result.duplicate_count}",
         f"Invalid rows:      {result.invalid_count}",
         f"Out of range rows: {result.out_of_range_count}",
         f"Missing candles:   {report.missing_candles}",
+        f"Market closures:   {len(report.market_closed_intervals)}",
         f"Quality status:    {report.status.value}",
     ]
 
@@ -133,6 +184,12 @@ def format_summary(result: DownloadResult) -> str:
     lines.extend(f"  - {path}" for path in result.files)
     lines.append(f"Manifest:          {result.manifest}")
     lines.append(f"Quality report:    {result.quality_report_path}")
+    lines.append(f"Checkpoint:        {result.checkpoint_path}")
+
+    if result.failures:
+        lines.append("Failed chunks:")
+        lines.extend(f"  - {failure}" for failure in result.failures)
+        lines.append("Rerun the same command to retry the failed chunks.")
 
     return "\n".join(lines)
 
@@ -147,9 +204,12 @@ def run_download(
     try:
         pipeline = DownloadPipeline(
             provider,
-            output_root=args.output_root,
+            output_root=args.data_root,
             manifest_root=args.manifest_root,
             quality_root=args.quality_root,
+            checkpoint_root=args.checkpoint_root,
+            calendar=get_calendar(args.calendar),
+            chunk_size=args.chunk_size,
             strict=args.strict,
         )
 
@@ -158,6 +218,7 @@ def run_download(
             start=args.start,
             end=args.end,
             timeframe=args.timeframe,
+            resume=args.resume,
         )
     finally:
         close = getattr(provider, "close", None)
@@ -170,7 +231,8 @@ def run_download(
     else:
         print(format_summary(result))
 
-    return 0
+    # A failed chunk leaves a hole in the dataset; the run is not a success.
+    return 1 if result.chunks_failed else 0
 
 
 def main(

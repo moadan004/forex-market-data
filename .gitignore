@@ -30,8 +30,9 @@ htmlcov/
 Thumbs.db
 
 # Market data
-data/raw/
-data/processed/
+# Everything under data/ is produced by a download: Parquet partitions,
+# manifests, quality reports and resume checkpoints.
+data/
 *.parquet
 *.csv
 

@@ -1,9 +1,24 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from marketdata.calendar import MarketCalendar
+from marketdata.calendar.forex import ForexCalendar
+from marketdata.downloader.checkpoint import (
+    CheckpointStore,
+    DownloadCheckpoint,
+    mark_completed,
+    mark_failed,
+    mark_running,
+)
+from marketdata.downloader.chunks import (
+    Chunk,
+    ChunkSize,
+    MonthlyChunkSize,
+    plan_chunks,
+)
 from marketdata.normalization.timestamps import ensure_utc, normalize_candles
 from marketdata.providers.base import MarketDataProvider
 from marketdata.quality.report import (
@@ -11,18 +26,34 @@ from marketdata.quality.report import (
     build_quality_report,
     write_quality_report,
 )
-from marketdata.storage.manifest import (
-    create_manifest,
-    write_manifest,
-)
+from marketdata.storage.manifest import create_manifest, write_manifest
 from marketdata.storage.parquet import ParquetStorage, normalize_symbol_path
 from marketdata.validation.candles import (
     CandleValidationError,
+    CandleViolation,
     deduplicate_candles,
     partition_candles,
     restrict_to_range,
     validate_candles,
 )
+
+
+@dataclass
+class ChunkOutcome:
+    """What one chunk contributed to the run."""
+
+    chunk: Chunk
+    downloaded: int = 0
+    out_of_range: int = 0
+    duplicates: int = 0
+    retained: int = 0
+    files: list[Path] = field(default_factory=list)
+    violations: list[CandleViolation] = field(default_factory=list)
+    error: str | None = None
+
+    @property
+    def failed(self) -> bool:
+        return self.error is not None
 
 
 @dataclass(frozen=True)
@@ -35,13 +66,19 @@ class DownloadResult:
     actual_start: datetime | None
     actual_end: datetime | None
     downloaded_count: int
-    final_count: int
+    retained_count: int
     duplicate_count: int
     invalid_count: int
     out_of_range_count: int
+    chunks_total: int
+    chunks_completed: int
+    chunks_failed: int
+    chunks_skipped: int
+    failures: list[str]
     files: list[Path]
     manifest: Path
     quality_report_path: Path
+    checkpoint_path: Path
     quality: QualityReport
 
 
@@ -49,10 +86,16 @@ class DownloadPipeline:
     """
     Orchestrate the production ingestion path.
 
-    Every stage is applied explicitly and in order::
+    A request is planned into chunks, and each chunk runs the full ingestion
+    sequence on its own::
 
-        fetch -> normalize -> validate -> deduplicate -> validate again
-              -> storage -> manifest -> quality report
+        fetch -> normalize -> restrict to range -> validate -> deduplicate
+              -> validate again -> merge into Parquet -> checkpoint
+
+    Chunks are independent: one failing leaves the others' data and their
+    checkpoint records intact, and a later run resumes from the first chunk
+    that did not complete. The manifest and quality report are written once
+    at the end and describe the stored dataset, not just this run's chunks.
     """
 
     def __init__(
@@ -62,12 +105,18 @@ class DownloadPipeline:
         output_root: str | Path = "data/processed",
         manifest_root: str | Path = "data/manifests",
         quality_root: str | Path = "data/quality",
+        checkpoint_root: str | Path = "data/checkpoints",
+        calendar: MarketCalendar | None = None,
+        chunk_size: ChunkSize | None = None,
         strict: bool = False,
     ) -> None:
         self.provider = provider
         self.storage = ParquetStorage(output_root)
         self.manifest_root = Path(manifest_root)
         self.quality_root = Path(quality_root)
+        self.checkpoints = CheckpointStore(checkpoint_root)
+        self.calendar = calendar or ForexCalendar()
+        self.chunk_size = chunk_size or MonthlyChunkSize()
         self.strict = strict
 
     def run(
@@ -77,6 +126,7 @@ class DownloadPipeline:
         start: datetime,
         end: datetime,
         timeframe: str = "1min",
+        resume: bool = True,
     ) -> DownloadResult:
         start = ensure_utc(start)
         end = ensure_utc(end)
@@ -84,70 +134,180 @@ class DownloadPipeline:
         if start >= end:
             raise ValueError("start must be before end")
 
-        # 1. Fetch from the provider.
-        downloaded = self.provider.fetch_candles(
+        chunks = plan_chunks(start, end, self.chunk_size)
+
+        checkpoint = self.checkpoints.open(
+            provider=self.provider.name,
             symbol=symbol,
+            timeframe=timeframe,
             start=start,
             end=end,
-            timeframe=timeframe,
+            chunks=chunks,
+            chunk_size=self.chunk_size.label,
+            resume=resume,
         )
-        downloaded_count = len(downloaded)
 
-        # 2. Normalize every timestamp to UTC and order chronologically.
-        normalized = normalize_candles(downloaded)
+        outcomes: list[ChunkOutcome] = []
+        skipped = 0
 
-        # 3. Drop anything outside the requested range, so the dataset can
-        #    never contain data from beyond the window it was asked for.
-        in_range, out_of_range = restrict_to_range(normalized, start, end)
+        for chunk in chunks:
+            if checkpoint.record(chunk.index).is_complete:
+                skipped += 1
+                continue
 
-        # 4. Validate OHLC invariants, keeping a record of what was rejected.
-        valid, violations = partition_candles(in_range)
-
-        if self.strict and violations:
-            raise CandleValidationError(
-                f"{len(violations)} invalid candles for {symbol} {timeframe}: "
-                f"{violations[0].reason}"
+            outcomes.append(
+                self._run_chunk(
+                    chunk,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    checkpoint=checkpoint,
+                )
             )
 
-        # 5. Remove duplicate timestamps.
-        deduplicated = deduplicate_candles(valid)
-        duplicate_count = len(valid) - len(deduplicated)
+        checkpoint_path = self.checkpoints.save(checkpoint)
 
-        # 6. Validate again: the stored dataset must satisfy the invariants
-        #    after every earlier transformation, not just before them.
-        validate_candles(deduplicated)
-
-        final_count = len(deduplicated)
-
-        # 7. Store as partitioned Parquet.
-        files = self.storage.write(
-            deduplicated,
+        return self._finish(
             symbol=symbol,
             timeframe=timeframe,
+            start=start,
+            end=end,
+            outcomes=outcomes,
+            checkpoint=checkpoint,
+            checkpoint_path=checkpoint_path,
+            skipped=skipped,
         )
+
+    def _run_chunk(
+        self,
+        chunk: Chunk,
+        *,
+        symbol: str,
+        timeframe: str,
+        checkpoint: DownloadCheckpoint,
+    ) -> ChunkOutcome:
+        mark_running(checkpoint, chunk.index)
+        self.checkpoints.save(checkpoint)
+
+        outcome = ChunkOutcome(chunk=chunk)
+
+        try:
+            # 1. Fetch this chunk from the provider.
+            downloaded = self.provider.fetch_candles(
+                symbol=symbol,
+                start=chunk.start,
+                end=chunk.end,
+                timeframe=timeframe,
+            )
+            outcome.downloaded = len(downloaded)
+
+            # 2. Normalize every timestamp to UTC and order chronologically.
+            normalized = normalize_candles(downloaded)
+
+            # 3. Drop anything outside the chunk, so the dataset can never
+            #    contain data from beyond the window it was asked for.
+            in_range, out_of_range = restrict_to_range(
+                normalized,
+                chunk.start,
+                chunk.end,
+            )
+            outcome.out_of_range = len(out_of_range)
+
+            # 4. Validate OHLC invariants, recording what was rejected.
+            valid, violations = partition_candles(in_range)
+            outcome.violations = violations
+
+            if self.strict and violations:
+                raise CandleValidationError(
+                    f"{len(violations)} invalid candles for {symbol} {timeframe}: "
+                    f"{violations[0].reason}"
+                )
+
+            # 5. Remove duplicate timestamps.
+            deduplicated = deduplicate_candles(valid)
+            outcome.duplicates = len(valid) - len(deduplicated)
+
+            # 6. Validate again: the stored dataset must satisfy the
+            #    invariants after every earlier transformation.
+            validate_candles(deduplicated)
+            outcome.retained = len(deduplicated)
+
+            # 7. Merge into the partitioned Parquet dataset.
+            outcome.files = self.storage.write(
+                deduplicated,
+                symbol=symbol,
+                timeframe=timeframe,
+            )
+        except Exception as exc:
+            if self.strict:
+                mark_failed(checkpoint, chunk.index, str(exc))
+                self.checkpoints.save(checkpoint)
+                raise
+
+            outcome.error = f"{type(exc).__name__}: {exc}"
+            mark_failed(checkpoint, chunk.index, outcome.error)
+        else:
+            mark_completed(
+                checkpoint,
+                chunk.index,
+                row_count=outcome.retained,
+                files=outcome.files,
+            )
+
+        self.checkpoints.save(checkpoint)
+
+        return outcome
+
+    def _finish(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        start: datetime,
+        end: datetime,
+        outcomes: list[ChunkOutcome],
+        checkpoint: DownloadCheckpoint,
+        checkpoint_path: Path,
+        skipped: int,
+    ) -> DownloadResult:
+        # The report describes what is on disk for the requested range, so a
+        # resumed run reports the whole dataset and not only its own chunks.
+        timestamps = self.storage.read_timestamps(
+            symbol=symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+        )
+
+        violations = [
+            violation for outcome in outcomes for violation in outcome.violations
+        ]
+        files = sorted({path for outcome in outcomes for path in outcome.files})
 
         report = build_quality_report(
             provider=self.provider.name,
             symbol=symbol,
             timeframe=timeframe,
+            calendar=self.calendar,
             requested_start=start,
             requested_end=end,
-            candles=deduplicated,
-            downloaded_rows=downloaded_count,
-            duplicates_removed=duplicate_count,
-            out_of_range_rows=len(out_of_range),
+            timestamps=timestamps,
+            downloaded_rows=sum(outcome.downloaded for outcome in outcomes),
+            duplicates_removed=sum(outcome.duplicates for outcome in outcomes),
+            out_of_range_rows=sum(outcome.out_of_range for outcome in outcomes),
             violations=violations,
+            chunks_total=len(checkpoint.chunks),
+            chunks_completed=checkpoint.completed_chunks,
+            chunks_failed=checkpoint.failed_chunks,
         )
 
         slug = self._dataset_slug(timeframe, start, end)
         directory = normalize_symbol_path(symbol)
         quality_path = self.quality_root / directory / f"{slug}.json"
 
-        # 8. Record the manifest.
         manifest = create_manifest(
             symbol=symbol,
             timeframe=timeframe,
-            candles_count=final_count,
+            candles_count=report.retained_rows,
             start=start,
             end=end,
             actual_start=report.actual_start,
@@ -156,6 +316,7 @@ class DownloadPipeline:
             files=files,
             quality_report=quality_path,
             quality_status=report.status.value,
+            checkpoint=checkpoint_path,
         )
 
         manifest_path = write_manifest(
@@ -163,7 +324,6 @@ class DownloadPipeline:
             self.manifest_root / directory / f"{slug}.json",
         )
 
-        # 9. Persist the quality report.
         write_quality_report(report, quality_path)
 
         return DownloadResult(
@@ -174,14 +334,26 @@ class DownloadPipeline:
             requested_end=end,
             actual_start=report.actual_start,
             actual_end=report.actual_end,
-            downloaded_count=downloaded_count,
-            final_count=final_count,
-            duplicate_count=duplicate_count,
-            invalid_count=len(violations),
-            out_of_range_count=len(out_of_range),
+            downloaded_count=report.downloaded_rows,
+            retained_count=report.retained_rows,
+            duplicate_count=report.duplicates_removed,
+            invalid_count=report.invalid_rows,
+            out_of_range_count=report.out_of_range_rows,
+            chunks_total=report.chunks_total,
+            chunks_completed=report.chunks_completed,
+            chunks_failed=report.chunks_failed,
+            chunks_skipped=skipped,
+            failures=[
+                f"chunk {outcome.chunk.index} "
+                f"({outcome.chunk.start:%Y-%m-%dT%H:%M:%SZ} -> "
+                f"{outcome.chunk.end:%Y-%m-%dT%H:%M:%SZ}): {outcome.error}"
+                for outcome in outcomes
+                if outcome.failed
+            ],
             files=files,
             manifest=manifest_path,
             quality_report_path=quality_path,
+            checkpoint_path=checkpoint_path,
             quality=report,
         )
 

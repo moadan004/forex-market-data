@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Iterable
 from datetime import datetime, timedelta
 from itertools import pairwise
 
 from pydantic import BaseModel
+
+from marketdata.calendar.base import MarketCalendar
 
 
 class MissingInterval(BaseModel):
@@ -103,6 +106,40 @@ def find_missing_intervals(
                 )
 
     return intervals
+
+
+def find_missing_trading_intervals(
+    timestamps: Iterable[datetime],
+    cadence: timedelta,
+    *,
+    start: datetime,
+    end: datetime,
+    calendar: MarketCalendar,
+) -> list[MissingInterval]:
+    """
+    Return the stretches of expected *trading* time with no candles.
+
+    Gaps are searched inside each open session separately, so a market
+    closure never registers as missing data and a session boundary never
+    hides a genuine gap next to it.
+    """
+    ordered = sorted(timestamps)
+    missing: list[MissingInterval] = []
+
+    for open_start, open_end in calendar.open_intervals(start, end):
+        first = bisect_left(ordered, open_start)
+        last = bisect_left(ordered, open_end)
+
+        missing.extend(
+            find_missing_intervals(
+                ordered[first:last],
+                cadence,
+                start=open_start,
+                end=open_end,
+            )
+        )
+
+    return missing
 
 
 def expected_candle_count(

@@ -98,6 +98,7 @@ def run_pipeline(tmp_path, candles, **kwargs):
         output_root=tmp_path / "processed",
         manifest_root=tmp_path / "manifests",
         quality_root=tmp_path / "quality",
+        checkpoint_root=tmp_path / "checkpoints",
         **kwargs,
     )
 
@@ -118,7 +119,7 @@ def test_pipeline_applies_every_stage(tmp_path):
     assert result.out_of_range_count == 2
     assert result.invalid_count == 1
     assert result.duplicate_count == 1
-    assert result.final_count == 2
+    assert result.retained_count == 2
 
     # The row arithmetic must account for every downloaded row.
     assert (
@@ -126,7 +127,7 @@ def test_pipeline_applies_every_stage(tmp_path):
         - result.out_of_range_count
         - result.invalid_count
         - result.duplicate_count
-        == result.final_count
+        == result.retained_count
     )
 
 
@@ -178,7 +179,7 @@ def test_pipeline_writes_manifest_and_quality_report(tmp_path):
     assert report["requested_start"].startswith("2026-08-14T12:00:00")
     assert report["actual_start"].startswith("2026-08-14T12:00:00")
     assert report["downloaded_rows"] == 6
-    assert report["final_rows"] == 2
+    assert report["retained_rows"] == 2
     assert report["duplicates_removed"] == 1
     assert report["invalid_rows"] == 1
     assert report["expected_rows"] == 60
@@ -192,14 +193,14 @@ def test_pipeline_reports_ok_for_a_complete_hour(tmp_path):
     _, result = run_pipeline(tmp_path, candles)
 
     assert result.quality.status is QualityStatus.OK
-    assert result.final_count == 60
+    assert result.retained_count == 60
     assert result.quality.missing_candles == 0
 
 
 def test_pipeline_handles_an_empty_provider_response(tmp_path):
     _, result = run_pipeline(tmp_path, [])
 
-    assert result.final_count == 0
+    assert result.retained_count == 0
     assert result.files == []
     assert result.quality.status is QualityStatus.EMPTY
     assert result.manifest.exists()
@@ -232,6 +233,7 @@ def test_pipeline_rejects_an_inverted_range(tmp_path):
         output_root=tmp_path / "processed",
         manifest_root=tmp_path / "manifests",
         quality_root=tmp_path / "quality",
+        checkpoint_root=tmp_path / "checkpoints",
     )
 
     with pytest.raises(ValueError, match="start must be before end"):
@@ -246,6 +248,7 @@ def test_pipeline_normalizes_a_non_utc_request_window(tmp_path):
         output_root=tmp_path / "processed",
         manifest_root=tmp_path / "manifests",
         quality_root=tmp_path / "quality",
+        checkpoint_root=tmp_path / "checkpoints",
     )
 
     result = pipeline.run(
