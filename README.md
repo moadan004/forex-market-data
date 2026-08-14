@@ -10,6 +10,12 @@ failure. It is intended as the data foundation for later research and
 backtesting work, so datasets are reproducible and describe their own gaps
 rather than hiding them.
 
+> **Roadmap:** [`planner.md`](planner.md) is the authoritative development
+> roadmap — phases, status, blockers and the next milestone. This README
+> describes only what is implemented today. No historical dataset has been
+> acquired yet, and no backtesting engine exists; both are tracked in the
+> planner.
+
 ## Architecture
 
 ```text
@@ -337,3 +343,15 @@ For every stored dataset:
   memory. A seven-year one-minute range is a few million values.
 - A chunk is retried whole. There is no partial-chunk recovery and no
   automatic retry within a single run — rerun the command.
+- There is no rate limiting. Requests are issued as fast as the download loop
+  allows, which is not yet suitable for a multi-year run against a free
+  endpoint.
+
+## Roadmap
+
+See [`planner.md`](planner.md) for the full phase breakdown, per-phase
+acceptance criteria, current blockers and the next milestone. In short: the
+ingestion path through resumable chunked downloads is complete; retry/backoff
+and rate limiting are next; live provider access is blocked by the
+development environment's egress policy; dataset acquisition, backtesting,
+analytics and the UI are planned and not started.
