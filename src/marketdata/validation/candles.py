@@ -1,4 +1,9 @@
+from __future__ import annotations
+
 from collections import Counter
+from datetime import datetime
+
+from pydantic import BaseModel
 
 from marketdata.models.candle import Candle
 
@@ -7,34 +12,112 @@ class CandleValidationError(ValueError):
     """Raised when a candle dataset violates market-data invariants."""
 
 
-def validate_candle(candle: Candle) -> None:
-    """Validate a single OHLCV candle."""
-    if candle.high < candle.open:
-        raise CandleValidationError("high cannot be below open")
+class CandleViolation(BaseModel):
+    """A single rejected candle and the invariant it broke."""
 
-    if candle.high < candle.close:
-        raise CandleValidationError("high cannot be below close")
+    model_config = {"frozen": True}
 
-    if candle.low > candle.open:
-        raise CandleValidationError("low cannot be above open")
+    timestamp: datetime
+    symbol: str
+    reason: str
 
-    if candle.low > candle.close:
-        raise CandleValidationError("low cannot be above close")
+
+def candle_violation(candle: Candle) -> str | None:
+    """Return the first invariant a candle breaks, or ``None`` when valid."""
+    if candle.timestamp.tzinfo is None:
+        return "timestamp must be timezone-aware"
 
     if candle.high < candle.low:
-        raise CandleValidationError("high cannot be below low")
+        return "high cannot be below low"
+
+    if candle.high < candle.open:
+        return "high cannot be below open"
+
+    if candle.high < candle.close:
+        return "high cannot be below close"
+
+    if candle.low > candle.open:
+        return "low cannot be above open"
+
+    if candle.low > candle.close:
+        return "low cannot be above close"
 
     if candle.volume < 0:
-        raise CandleValidationError("volume cannot be negative")
+        return "volume cannot be negative"
 
-    if candle.timestamp.tzinfo is None:
-        raise CandleValidationError("timestamp must be timezone-aware")
+    return None
+
+
+def validate_candle(candle: Candle) -> None:
+    """Validate a single OHLCV candle."""
+    reason = candle_violation(candle)
+
+    if reason is not None:
+        raise CandleValidationError(reason)
 
 
 def validate_candles(candles: list[Candle]) -> None:
     """Validate an entire candle collection."""
     for candle in candles:
         validate_candle(candle)
+
+
+def partition_candles(
+    candles: list[Candle],
+) -> tuple[list[Candle], list[CandleViolation]]:
+    """
+    Split candles into the valid ones and a record of the rejected ones.
+
+    Ingestion needs to report on bad rows rather than abort on the first one,
+    so this is the non-raising counterpart of :func:`validate_candles`.
+    """
+    valid: list[Candle] = []
+    violations: list[CandleViolation] = []
+
+    for candle in candles:
+        reason = candle_violation(candle)
+
+        if reason is None:
+            valid.append(candle)
+            continue
+
+        violations.append(
+            CandleViolation(
+                timestamp=candle.timestamp,
+                symbol=candle.symbol,
+                reason=reason,
+            )
+        )
+
+    return valid, violations
+
+
+def restrict_to_range(
+    candles: list[Candle],
+    start: datetime,
+    end: datetime,
+) -> tuple[list[Candle], list[Candle]]:
+    """
+    Keep only candles inside the half-open range ``[start, end)``.
+
+    Stored datasets must never contain observations outside the range they
+    were requested for: a candle beyond ``end`` is future data relative to
+    the request and would leak look-ahead information into any backtest
+    built on the dataset.
+    """
+    if start.tzinfo is None or end.tzinfo is None:
+        raise ValueError("start and end must be timezone-aware")
+
+    inside: list[Candle] = []
+    outside: list[Candle] = []
+
+    for candle in candles:
+        if start <= candle.timestamp < end:
+            inside.append(candle)
+        else:
+            outside.append(candle)
+
+    return inside, outside
 
 
 def deduplicate_candles(candles: list[Candle]) -> list[Candle]:

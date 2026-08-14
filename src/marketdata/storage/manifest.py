@@ -11,11 +11,15 @@ class DatasetManifest(BaseModel):
     timeframe: str
     start: datetime
     end: datetime
+    actual_start: datetime | None = None
+    actual_end: datetime | None = None
     row_count: int
     provider: str
     dataset_version: str = "1.0.0"
     created_at: datetime
     files: list[str]
+    quality_report: str | None = None
+    quality_status: str | None = None
 
 
 def create_manifest(
@@ -27,16 +31,24 @@ def create_manifest(
     end: datetime,
     provider: str,
     files: list[Path],
+    actual_start: datetime | None = None,
+    actual_end: datetime | None = None,
+    quality_report: str | Path | None = None,
+    quality_status: str | None = None,
 ) -> DatasetManifest:
     return DatasetManifest(
         symbol=symbol,
         timeframe=timeframe,
         start=start,
         end=end,
+        actual_start=actual_start,
+        actual_end=actual_end,
         row_count=candles_count,
         provider=provider,
         created_at=datetime.now(UTC),
         files=[str(path) for path in files],
+        quality_report=str(quality_report) if quality_report is not None else None,
+        quality_status=quality_status,
     )
 
 
