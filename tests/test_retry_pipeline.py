@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+from conftest import instant_limiter
 
 from marketdata.calendar import AlwaysOpenCalendar
 from marketdata.cli import build_parser, main, retry_policy_from_args
@@ -73,6 +74,7 @@ def build_pipeline(tmp_path, api, *, policy: RetryPolicy = INSTANT, **kwargs):
     provider = DukascopyProvider(
         client=httpx.Client(transport=httpx.MockTransport(api.handler)),
         retry_policy=policy,
+        rate_limiter=instant_limiter(),
     )
 
     return DownloadPipeline(
@@ -328,6 +330,7 @@ def test_the_summary_reports_provider_retries(tmp_path, capsys):
         return DukascopyProvider(
             client=httpx.Client(transport=httpx.MockTransport(api.handler)),
             retry_policy=INSTANT,
+            rate_limiter=instant_limiter(),
         )
 
     exit_code = main(

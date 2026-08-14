@@ -27,7 +27,7 @@ against `src/` and `tests/` on the current branch.
 | 1 | Environment and repository | ✅ |
 | 2 | Market-data foundation | ✅ |
 | 3 | Data pipeline | ✅ |
-| 4 | Production historical-data ingestion | 🟡 |
+| 4 | Production historical-data ingestion | ✅ |
 | 5 | Historical dataset acquisition | 🔴 |
 | 6 | Data-quality verification | 🟡 |
 | 7 | Backtesting engine | ⬜ |
@@ -37,7 +37,7 @@ against `src/` and `tests/` on the current branch.
 | 11 | API and UI | ⬜ |
 | 12 | Production | ⬜ |
 
-Test suite: **253 passing**. Ruff format and check: clean.
+Test suite: **301 passing**. Ruff format and check: clean.
 
 ---
 
@@ -132,7 +132,7 @@ honest about market closures.
 | Partition merging | ✅ | `storage/parquet.py` |
 | Retry / backoff | ✅ | `providers/retry.py`, wired into the Dukascopy request layer |
 | Provider error classification | ✅ | `providers/errors.py` |
-| Rate limiting | ⬜ | **Not implemented.** No throttle, delay or concurrency limit exists |
+| Rate limiting | ✅ | `providers/rate_limit.py`, applied to every request including retries |
 
 **Acceptance criteria**
 
@@ -151,11 +151,11 @@ honest about market closures.
 - A permanent error fails fast instead of being retried.
 - Retry counts, the last error and whether the final failure was transient
   are recorded in the checkpoint and survive a restart.
-- *(outstanding)* A long run stays within the provider's rate limits without
-  manual pacing.
+- A long run stays within a configured request rate without manual pacing,
+  and retries are paced by the same limiter rather than exempt from it.
 
-Every criterion except the last is met and tested. Rate limiting remains and
-gates Phase 5.
+Every criterion is met and tested. Phase 4 is complete; Phase 5 is gated only
+by live provider access.
 
 ---
 
@@ -393,12 +393,11 @@ real acquired dataset, which Phase 5 gates.
 
 ### Implementation blockers
 
-These are within our control and must be finished before large-scale
-acquisition, independently of the environment blocker above.
-
-| Blocker | Why it gates acquisition |
-| --- | --- |
-| No rate limiting | Nothing paces requests. A long run risks throttling or a ban from a free endpoint, and requests are issued as fast as the download loop allows. Retries now back off after a 429, but nothing prevents reaching one. |
+**None.** The ingestion path is feature-complete for large-scale acquisition:
+chunked, resumable, merging safely, retrying transient failures with bounded
+backoff, and pacing every request including retries. What remains before
+Phase 5 is verification against the live provider, which is an environment
+blocker rather than missing code.
 
 ### Known inconsistencies
 
@@ -429,12 +428,17 @@ the staged acquisition of Phase 5.
 | # | Milestone | Status | Done when |
 | --- | --- | --- | --- |
 | 1 | **Retry / backoff** | ✅ done | A transient provider failure is retried with exponential backoff and a bounded attempt count; retries are recorded in the checkpoint; tests cover success-after-retry and exhaustion. |
-| 2 | **Rate limiting** | ⬜ next | Requests are paced by a configurable limit; a long run cannot exceed it; the limit is a CLI option with a documented default. |
-| 3 | **Live provider verification** | 🔴 | The one-hour smoke test returns real candles from Dukascopy and the response matches the mocked assumptions, or the provider is corrected and regression tests are added. Blocked by egress policy. |
+| 2 | **Rate limiting** | ✅ done | Requests are paced by a configurable limit; a long run cannot exceed it; the limit is a CLI option with a documented default. |
+| 3 | **Live provider verification** | 🔴 next | The one-hour smoke test returns real candles from Dukascopy and the response matches the mocked assumptions, or the provider is corrected and regression tests are added. Blocked by egress policy. |
 | 4 | **One-day acquisition** | ⬜ | A full trading day of EUR/USD 1-minute data is stored with a quality report of `ok`. |
 | 5 | **One-month acquisition** | ⬜ | A calendar month is stored across multiple chunks; weekends appear as closures, not gaps. |
 | 6 | **One-year acquisition** | ⬜ | A year completes, survives at least one deliberate interruption and resume, and runtime is recorded. |
 | 7 | **5–7 year acquisition** | ⬜ | The target dataset is acquired per symbol and passes Phase 6 verification. |
+
+Rate limiting defaults to **2 requests/second**, applied to every outbound
+request including retries. It does not replace retry/backoff: backoff decides
+when it is worth trying again, the limiter decides how fast requests may
+leave at all.
 
 **Provider error classification** (Phase 4) was delivered with milestone 1:
 retry logic cannot be written correctly without knowing which failures are

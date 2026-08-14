@@ -13,6 +13,11 @@ from marketdata.providers.errors import (
     ProviderError,
     classify_http_error,
 )
+from marketdata.providers.rate_limit import (
+    RateLimit,
+    RateLimiter,
+    RateLimitStats,
+)
 from marketdata.providers.retry import RetryExecutor, RetryPolicy, RetryStats
 
 
@@ -58,6 +63,9 @@ class DukascopyProvider(MarketDataProvider):
         timeout: float = 30.0,
         client: httpx.Client | None = None,
         retry_policy: RetryPolicy | None = None,
+        retry_executor: RetryExecutor | None = None,
+        rate_limit: RateLimit | None = None,
+        rate_limiter: RateLimiter | None = None,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/") + "/"
@@ -65,7 +73,8 @@ class DukascopyProvider(MarketDataProvider):
         self._client = client
         self._owns_client = client is None
         self._instrument_cache: dict[str, int] = {}
-        self._retries = RetryExecutor(retry_policy)
+        self._retries = retry_executor or RetryExecutor(retry_policy)
+        self._rate_limiter = rate_limiter or RateLimiter(rate_limit)
 
     @property
     def name(self) -> str:
@@ -79,6 +88,15 @@ class DukascopyProvider(MarketDataProvider):
     def retry_stats(self) -> RetryStats:
         """Retries performed since the last reset, for the caller to record."""
         return self._retries.stats
+
+    @property
+    def rate_limit(self) -> RateLimit:
+        return self._rate_limiter.limit
+
+    @property
+    def rate_limit_stats(self) -> RateLimitStats:
+        """Throttling observed so far, for the caller to report."""
+        return self._rate_limiter.stats
 
     def _get_client(self) -> httpx.Client:
         if self._client is None:
@@ -101,8 +119,17 @@ class DukascopyProvider(MarketDataProvider):
         self.close()
 
     def _send(self, path: str, request_params: dict[str, Any]) -> Any:
-        """Issue one HTTP request and decode it, classifying any failure."""
+        """
+        Issue one HTTP request and decode it, classifying any failure.
+
+        Every request passes the rate limiter first. This sits inside the
+        retried operation on purpose: a retry is another request against an
+        endpoint that has just failed, and letting it skip the queue would
+        defeat the limit exactly when it matters most.
+        """
         context = f"Dukascopy request failed for {path}"
+
+        self._rate_limiter.acquire()
 
         try:
             response = self._get_client().get(
