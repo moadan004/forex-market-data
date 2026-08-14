@@ -118,6 +118,10 @@ def _carry_over(
     planned chunk exactly. Anything else — a different chunk size, a moved
     boundary — starts again, because the data it covers no longer lines up
     with what is about to be downloaded.
+
+    A matching chunk that did not complete goes back to pending so it is
+    retried, but keeps its attempt count and last error: how often a chunk
+    has already failed is the useful signal when a range refuses to download.
     """
     by_boundaries = {
         (record.chunk_start, record.chunk_end): record for record in previous.chunks
@@ -137,6 +141,8 @@ def _carry_over(
                 index=chunk.index,
                 chunk_start=chunk.start,
                 chunk_end=chunk.end,
+                attempts=stored.attempts if stored else 0,
+                error=stored.error if stored else None,
             )
         )
 

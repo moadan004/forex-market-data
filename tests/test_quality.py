@@ -1,9 +1,8 @@
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 
 import pytest
 
-from marketdata.models.candle import Candle
+from marketdata.calendar import AlwaysOpenCalendar, ForexCalendar
 from marketdata.models.timeframe import timeframe_cadence
 from marketdata.quality.gaps import (
     expected_candle_count,
@@ -21,27 +20,16 @@ END = datetime(2026, 8, 14, 13, 0, tzinfo=UTC)
 MINUTE = timedelta(minutes=1)
 
 
-def make_candle(timestamp: datetime) -> Candle:
-    return Candle(
-        timestamp=timestamp,
-        symbol="EUR/USD",
-        open=Decimal("1.1700"),
-        high=Decimal("1.1710"),
-        low=Decimal("1.1690"),
-        close=Decimal("1.1705"),
-        volume=Decimal(100),
-    )
-
-
-def build_report(candles, **overrides):
+def build_report(timestamps, **overrides):
     kwargs = {
         "provider": "fake",
         "symbol": "EUR/USD",
         "timeframe": "1min",
+        "calendar": AlwaysOpenCalendar(),
         "requested_start": START,
         "requested_end": END,
-        "candles": candles,
-        "downloaded_rows": len(candles),
+        "timestamps": timestamps,
+        "downloaded_rows": len(timestamps),
         "duplicates_removed": 0,
         "out_of_range_rows": 0,
         "violations": [],
@@ -103,12 +91,12 @@ def test_non_positive_cadence_is_rejected():
 
 
 def test_report_is_ok_for_complete_dataset():
-    candles = [make_candle(START + MINUTE * index) for index in range(60)]
+    stamps = [START + MINUTE * index for index in range(60)]
 
-    report = build_report(candles)
+    report = build_report(stamps)
 
     assert report.status is QualityStatus.OK
-    assert report.final_rows == 60
+    assert report.retained_rows == 60
     assert report.expected_rows == 60
     assert report.missing_candles == 0
     assert report.actual_start == START
@@ -117,23 +105,23 @@ def test_report_is_ok_for_complete_dataset():
 
 
 def test_report_flags_incomplete_dataset():
-    candles = [make_candle(START + MINUTE * index) for index in range(10)]
+    stamps = [START + MINUTE * index for index in range(10)]
 
-    report = build_report(candles)
+    report = build_report(stamps)
 
     assert report.status is QualityStatus.INCOMPLETE
     assert report.missing_candles == 50
 
 
 def test_report_flags_invalid_rows():
-    candles = [make_candle(START + MINUTE * index) for index in range(60)]
+    stamps = [START + MINUTE * index for index in range(60)]
     violation = CandleViolation(
         timestamp=START,
         symbol="EUR/USD",
         reason="high cannot be below low",
     )
 
-    report = build_report(candles, violations=[violation], downloaded_rows=61)
+    report = build_report(stamps, violations=[violation], downloaded_rows=61)
 
     assert report.status is QualityStatus.INVALID
     assert report.invalid_rows == 1
@@ -150,9 +138,9 @@ def test_report_flags_empty_dataset():
 
 
 def test_report_skips_gap_detection_for_variable_cadence():
-    candles = [make_candle(START)]
+    stamps = [START]
 
-    report = build_report(candles, timeframe="1day_eet")
+    report = build_report(stamps, timeframe="1day_eet")
 
     assert report.cadence_seconds is None
     assert report.expected_rows is None
@@ -177,12 +165,113 @@ def test_report_truncates_violation_samples():
     assert report.violations_truncated is True
 
 
+FRIDAY_CLOSE = datetime(2026, 8, 14, 21, 0, tzinfo=UTC)
+SUNDAY_OPEN = datetime(2026, 8, 16, 22, 0, tzinfo=UTC)
+NEXT_MONDAY = datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+
+
+def test_weekend_closure_is_not_reported_as_missing_data():
+    """The whole request is a market closure, so nothing was expected."""
+    report = build_report(
+        [],
+        calendar=ForexCalendar(),
+        requested_start=FRIDAY_CLOSE,
+        requested_end=SUNDAY_OPEN,
+    )
+
+    assert report.expected_rows == 0
+    assert report.missing_intervals == []
+    assert report.missing_candles == 0
+    assert report.status is QualityStatus.OK
+    assert len(report.market_closed_intervals) == 1
+    assert report.market_closed_intervals[0].reason == "weekend"
+
+
+def test_gaps_are_only_reported_inside_trading_hours():
+    """A Friday-to-Monday range holds data on both sides of the weekend."""
+    start = FRIDAY_CLOSE - MINUTE * 5
+    stamps = [start + MINUTE * index for index in range(5)] + [
+        SUNDAY_OPEN + MINUTE * index for index in range(120)
+    ]
+
+    report = build_report(
+        stamps,
+        calendar=ForexCalendar(),
+        requested_start=start,
+        requested_end=NEXT_MONDAY,
+    )
+
+    assert report.retained_rows == 125
+    assert report.expected_rows == 125
+    assert report.missing_intervals == []
+    assert report.status is QualityStatus.OK
+
+
+def test_a_gap_next_to_a_closure_is_still_reported():
+    start = FRIDAY_CLOSE - MINUTE * 5
+    stamps = [start, start + MINUTE]
+
+    report = build_report(
+        stamps,
+        calendar=ForexCalendar(),
+        requested_start=start,
+        requested_end=SUNDAY_OPEN,
+    )
+
+    assert report.status is QualityStatus.INCOMPLETE
+    assert len(report.missing_intervals) == 1
+    assert report.missing_intervals[0].start == start + MINUTE * 2
+    assert report.missing_intervals[0].end == FRIDAY_CLOSE
+    assert report.missing_candles == 3
+
+
+def test_the_same_range_looks_incomplete_without_calendar_awareness():
+    """Contrast: a 24x7 calendar counts the weekend as missing data."""
+    report = build_report(
+        [],
+        calendar=AlwaysOpenCalendar(),
+        requested_start=FRIDAY_CLOSE,
+        requested_end=SUNDAY_OPEN,
+    )
+
+    assert report.expected_rows == 49 * 60
+    assert report.missing_candles == 49 * 60
+    assert report.status is QualityStatus.EMPTY
+
+
+def test_report_records_chunk_progress():
+    stamps = [START + MINUTE * index for index in range(60)]
+
+    report = build_report(
+        stamps,
+        chunks_total=4,
+        chunks_completed=3,
+        chunks_failed=1,
+    )
+
+    assert report.chunks_total == 4
+    assert report.chunks_completed == 3
+    assert report.chunks_failed == 1
+    assert report.status is QualityStatus.FAILED
+
+
+def test_failed_chunks_outrank_every_other_status():
+    report = build_report([], chunks_failed=1)
+
+    assert report.status is QualityStatus.FAILED
+
+
+def test_report_names_the_calendar_it_used():
+    assert build_report([START]).calendar == "24x7"
+    assert build_report([START], calendar=ForexCalendar()).calendar == "forex"
+
+
 def test_report_is_machine_readable(tmp_path):
     import json
 
-    candles = [make_candle(START + MINUTE * index) for index in range(3)]
+    stamps = [START + MINUTE * index for index in range(3)]
 
-    report = build_report(candles)
+    report = build_report(stamps)
     path = write_quality_report(report, tmp_path / "report.json")
 
     payload = json.loads(path.read_text())

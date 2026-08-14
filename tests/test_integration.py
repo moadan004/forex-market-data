@@ -146,6 +146,8 @@ def test_download_command_produces_a_readable_dataset(
             str(tmp_path / "manifests"),
             "--quality-root",
             str(tmp_path / "quality"),
+            "--checkpoint-root",
+            str(tmp_path / "checkpoints"),
         ],
         provider_factory=provider_factory,
     )
@@ -198,6 +200,8 @@ def test_download_command_records_the_run(tmp_path, provider_factory):
             str(tmp_path / "manifests"),
             "--quality-root",
             str(tmp_path / "quality"),
+            "--checkpoint-root",
+            str(tmp_path / "checkpoints"),
         ],
         provider_factory=provider_factory,
     )
@@ -218,7 +222,7 @@ def test_download_command_records_the_run(tmp_path, provider_factory):
     assert manifest["quality_report"] == str(report_path)
 
     assert report["downloaded_rows"] == 60
-    assert report["final_rows"] == 60
+    assert report["retained_rows"] == 60
     assert report["expected_rows"] == 60
     assert report["duplicates_removed"] == 0
     assert report["invalid_rows"] == 0

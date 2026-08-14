@@ -20,6 +20,7 @@ class DatasetManifest(BaseModel):
     files: list[str]
     quality_report: str | None = None
     quality_status: str | None = None
+    checkpoint: str | None = None
 
 
 def create_manifest(
@@ -35,6 +36,7 @@ def create_manifest(
     actual_end: datetime | None = None,
     quality_report: str | Path | None = None,
     quality_status: str | None = None,
+    checkpoint: str | Path | None = None,
 ) -> DatasetManifest:
     return DatasetManifest(
         symbol=symbol,
@@ -49,6 +51,7 @@ def create_manifest(
         files=[str(path) for path in files],
         quality_report=str(quality_report) if quality_report is not None else None,
         quality_status=quality_status,
+        checkpoint=str(checkpoint) if checkpoint is not None else None,
     )
 
 

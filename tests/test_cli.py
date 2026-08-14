@@ -1,6 +1,7 @@
 import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import ClassVar
 
 import pytest
 
@@ -58,12 +59,14 @@ def download_argv(tmp_path, *extra):
         "2026-08-14T12:00:00Z",
         "--end",
         "2026-08-14T13:00:00Z",
-        "--output-root",
+        "--data-root",
         str(tmp_path / "processed"),
         "--manifest-root",
         str(tmp_path / "manifests"),
         "--quality-root",
         str(tmp_path / "quality"),
+        "--checkpoint-root",
+        str(tmp_path / "checkpoints"),
         *extra,
     ]
 
@@ -100,7 +103,7 @@ def test_parser_defaults_to_one_minute_candles():
     )
 
     assert args.timeframe == "1min"
-    assert args.output_root == "data/processed"
+    assert args.data_root == "data/processed"
     assert args.strict is False
 
 
@@ -144,7 +147,7 @@ def test_download_json_output_is_the_quality_report(tmp_path, capsys):
     assert exit_code == 0
     assert payload["symbol"] == "EUR/USD"
     assert payload["status"] == "ok"
-    assert payload["final_rows"] == 60
+    assert payload["retained_rows"] == 60
 
 
 def test_download_closes_the_provider(tmp_path):
@@ -155,12 +158,93 @@ def test_download_closes_the_provider(tmp_path):
     assert StubProvider.closed is True
 
 
-def test_download_reports_errors_without_a_traceback(tmp_path, capsys):
-    class FailingProvider(StubProvider):
-        def fetch_candles(self, symbol, start, end, timeframe="1min"):
-            raise ValueError("boom")
+class FailingProvider(StubProvider):
+    def fetch_candles(self, symbol, start, end, timeframe="1min"):
+        raise ValueError("boom")
 
+
+def test_a_failed_chunk_is_reported_and_exits_non_zero(tmp_path, capsys):
     exit_code = main(download_argv(tmp_path), provider_factory=FailingProvider)
+
+    output = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Quality status:    failed" in output
+    assert "Failed chunks:" in output
+    assert "ValueError: boom" in output
+    assert "Rerun the same command to retry" in output
+
+
+def test_strict_mode_stops_without_a_traceback(tmp_path, capsys):
+    exit_code = main(
+        download_argv(tmp_path, "--strict"),
+        provider_factory=FailingProvider,
+    )
 
     assert exit_code == 1
     assert "error: boom" in capsys.readouterr().out
+
+
+def test_invalid_chunk_size_is_rejected(tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        main(
+            download_argv(tmp_path, "--chunk-size", "7y"),
+            provider_factory=StubProvider,
+        )
+
+    assert "Invalid chunk size" in capsys.readouterr().err
+
+
+def test_chunked_download_issues_one_request_per_chunk(tmp_path, capsys):
+    class CountingProvider(StubProvider):
+        windows: ClassVar[list[tuple]] = []
+
+        def fetch_candles(self, symbol, start, end, timeframe="1min"):
+            type(self).windows.append((start, end))
+            return super().fetch_candles(symbol, start, end, timeframe)
+
+    CountingProvider.windows = []
+
+    exit_code = main(
+        download_argv(tmp_path, "--chunk-size", "30min"),
+        provider_factory=CountingProvider,
+    )
+
+    assert exit_code == 0
+    assert CountingProvider.windows == [
+        (START, START + MINUTE * 30),
+        (START + MINUTE * 30, START + MINUTE * 60),
+    ]
+    assert "Chunks:            2/2 completed" in capsys.readouterr().out
+
+
+def test_resume_skips_completed_chunks(tmp_path, capsys):
+    main(download_argv(tmp_path), provider_factory=StubProvider)
+    capsys.readouterr()
+
+    exit_code = main(download_argv(tmp_path), provider_factory=FailingProvider)
+
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "1 already done" in output
+    assert "Rows downloaded:   0" in output
+    assert "Rows retained:     60" in output
+    assert "Quality status:    ok" in output
+
+
+def test_no_resume_downloads_everything_again(tmp_path, capsys):
+    main(download_argv(tmp_path), provider_factory=StubProvider)
+    capsys.readouterr()
+
+    exit_code = main(
+        download_argv(tmp_path, "--no-resume"),
+        provider_factory=StubProvider,
+    )
+
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "0 already done" in output
+    assert "Rows downloaded:   60" in output
+    assert "Rows retained:     60" in output
