@@ -1,7 +1,7 @@
 [project]
 name = "forex-market-data"
 version = "0.1.0"
-description = "Add your description here"
+description = "Historical Forex market-data ingestion and quality pipeline"
 readme = "README.md"
 authors = [
     { name = "moadan340", email = "moadan340@gmail.com" }
@@ -17,11 +17,15 @@ dependencies = [
 ]
 
 [project.scripts]
-forex-market-data = "forex_market_data:main"
+marketdata = "marketdata.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.4,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "marketdata"
+module-root = "src"
 
 [dependency-groups]
 dev = [
