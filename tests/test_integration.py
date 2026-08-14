@@ -14,7 +14,11 @@ import pytest
 
 from marketdata.cli import main
 from marketdata.providers.dukascopy import DukascopyProvider
+from marketdata.providers.retry import RetryPolicy
 from marketdata.storage.parquet import CANDLE_SCHEMA, ParquetStorage
+
+# Retries are exercised deliberately below; no test may wait on real backoff.
+INSTANT_RETRIES = RetryPolicy(attempts=3, backoff_seconds=0)
 
 START = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
 END = datetime(2026, 8, 14, 13, 0, tzinfo=UTC)
@@ -97,7 +101,8 @@ def api() -> DukascopyStubApi:
 def provider_factory(api):
     def factory() -> DukascopyProvider:
         return DukascopyProvider(
-            client=httpx.Client(transport=httpx.MockTransport(api.handler))
+            client=httpx.Client(transport=httpx.MockTransport(api.handler)),
+            retry_policy=INSTANT_RETRIES,
         )
 
     return factory
@@ -297,7 +302,8 @@ def test_a_failed_chunk_is_recovered_by_rerunning(tmp_path, api, capsys):
 
     def provider_factory() -> DukascopyProvider:
         return DukascopyProvider(
-            client=httpx.Client(transport=httpx.MockTransport(handler))
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+            retry_policy=INSTANT_RETRIES,
         )
 
     assert download(tmp_path, provider_factory, "--chunk-size", "30min") == 1

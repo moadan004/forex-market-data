@@ -8,7 +8,14 @@ from marketdata.calendar import CALENDARS, get_calendar
 from marketdata.downloader.chunks import ChunkSize, parse_chunk_size
 from marketdata.downloader.pipeline import DownloadPipeline, DownloadResult
 from marketdata.providers.base import MarketDataProvider
-from marketdata.providers.dukascopy import DukascopyError, DukascopyProvider
+from marketdata.providers.dukascopy import DukascopyProvider
+from marketdata.providers.errors import ProviderError
+from marketdata.providers.retry import (
+    DEFAULT_ATTEMPTS,
+    DEFAULT_BACKOFF_SECONDS,
+    DEFAULT_MAX_BACKOFF_SECONDS,
+    RetryPolicy,
+)
 
 ProviderFactory = Callable[[], MarketDataProvider]
 
@@ -121,6 +128,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Root directory for resume checkpoints. Default: data/checkpoints.",
     )
     download.add_argument(
+        "--retry-attempts",
+        type=int,
+        default=DEFAULT_ATTEMPTS,
+        help=(
+            "Total attempts per provider request, including the first. "
+            f"1 disables retries. Default: {DEFAULT_ATTEMPTS}."
+        ),
+    )
+    download.add_argument(
+        "--retry-backoff",
+        type=float,
+        default=DEFAULT_BACKOFF_SECONDS,
+        help=(
+            "Seconds to wait before the first retry, doubling thereafter. "
+            f"Default: {DEFAULT_BACKOFF_SECONDS}."
+        ),
+    )
+    download.add_argument(
+        "--retry-max-backoff",
+        type=float,
+        default=DEFAULT_MAX_BACKOFF_SECONDS,
+        help=(
+            "Upper bound on the wait between retries. "
+            f"Default: {DEFAULT_MAX_BACKOFF_SECONDS}."
+        ),
+    )
+    download.add_argument(
         "--strict",
         action="store_true",
         help=(
@@ -172,6 +206,7 @@ def format_summary(result: DownloadResult) -> str:
         f"Duplicates:        {result.duplicate_count}",
         f"Invalid rows:      {result.invalid_count}",
         f"Out of range rows: {result.out_of_range_count}",
+        f"Provider retries:  {result.retries}",
         f"Missing candles:   {report.missing_candles}",
         f"Market closures:   {len(report.market_closed_intervals)}",
         f"Quality status:    {report.status.value}",
@@ -194,11 +229,25 @@ def format_summary(result: DownloadResult) -> str:
     return "\n".join(lines)
 
 
+def retry_policy_from_args(args: argparse.Namespace) -> RetryPolicy:
+    """Build the retry policy the provider should use."""
+    return RetryPolicy(
+        attempts=args.retry_attempts,
+        backoff_seconds=args.retry_backoff,
+        max_backoff_seconds=args.retry_max_backoff,
+    )
+
+
 def run_download(
     args: argparse.Namespace,
     *,
-    provider_factory: ProviderFactory = DukascopyProvider,
+    provider_factory: ProviderFactory | None = None,
 ) -> int:
+    if provider_factory is None:
+
+        def provider_factory() -> MarketDataProvider:
+            return DukascopyProvider(retry_policy=retry_policy_from_args(args))
+
     provider = provider_factory()
 
     try:
@@ -238,7 +287,7 @@ def run_download(
 def main(
     argv: Sequence[str] | None = None,
     *,
-    provider_factory: ProviderFactory = DukascopyProvider,
+    provider_factory: ProviderFactory | None = None,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -249,7 +298,7 @@ def main(
 
     try:
         return run_download(args, provider_factory=provider_factory)
-    except (DukascopyError, ValueError) as exc:
+    except (ProviderError, ValueError) as exc:
         print(f"error: {exc}")
         return 1
 

@@ -8,10 +8,22 @@ import httpx
 
 from marketdata.models.candle import Candle
 from marketdata.providers.base import MarketDataProvider
+from marketdata.providers.errors import (
+    ProviderDataError,
+    ProviderError,
+    classify_http_error,
+)
+from marketdata.providers.retry import RetryExecutor, RetryPolicy, RetryStats
 
 
-class DukascopyError(RuntimeError):
-    """Raised when Dukascopy cannot provide the requested data."""
+class DukascopyError(ProviderDataError):
+    """
+    Raised when Dukascopy answers but cannot provide the requested data.
+
+    An unsupported symbol or an unusable payload will not change on a second
+    attempt, so this is a permanent failure. Transport and status failures
+    are classified separately in :mod:`marketdata.providers.errors`.
+    """
 
 
 class DukascopyProvider(MarketDataProvider):
@@ -45,6 +57,7 @@ class DukascopyProvider(MarketDataProvider):
         base_url: str = DEFAULT_BASE_URL,
         timeout: float = 30.0,
         client: httpx.Client | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/") + "/"
@@ -52,10 +65,20 @@ class DukascopyProvider(MarketDataProvider):
         self._client = client
         self._owns_client = client is None
         self._instrument_cache: dict[str, int] = {}
+        self._retries = RetryExecutor(retry_policy)
 
     @property
     def name(self) -> str:
         return "dukascopy"
+
+    @property
+    def retry_policy(self) -> RetryPolicy:
+        return self._retries.policy
+
+    @property
+    def retry_stats(self) -> RetryStats:
+        """Retries performed since the last reset, for the caller to record."""
+        return self._retries.stats
 
     def _get_client(self) -> httpx.Client:
         if self._client is None:
@@ -77,15 +100,9 @@ class DukascopyProvider(MarketDataProvider):
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
 
-    def _request(
-        self,
-        path: str,
-        params: dict[str, Any] | None = None,
-    ) -> Any:
-        request_params = dict(params or {})
-
-        if self.api_key:
-            request_params["key"] = self.api_key
+    def _send(self, path: str, request_params: dict[str, Any]) -> Any:
+        """Issue one HTTP request and decode it, classifying any failure."""
+        context = f"Dukascopy request failed for {path}"
 
         try:
             response = self._get_client().get(
@@ -97,12 +114,30 @@ class DukascopyProvider(MarketDataProvider):
             )
             response.raise_for_status()
         except httpx.HTTPError as exc:
-            raise DukascopyError(f"Dukascopy request failed for {path}: {exc}") from exc
+            raise classify_http_error(exc, context=context) from exc
 
         try:
             return response.json()
         except ValueError as exc:
             raise DukascopyError(f"Dukascopy returned invalid JSON for {path}") from exc
+
+    def _request(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        """
+        Issue a request, retrying transient failures.
+
+        Retries wrap the whole exchange rather than the socket alone, so a
+        429 or a 5xx is retried the same way a dropped connection is.
+        """
+        request_params = dict(params or {})
+
+        if self.api_key:
+            request_params["key"] = self.api_key
+
+        return self._retries(lambda: self._send(path, request_params))
 
     def get_supported_symbols(self) -> Sequence[str]:
         """Return all symbol names exposed by Dukascopy."""
@@ -282,7 +317,7 @@ class DukascopyProvider(MarketDataProvider):
                 "instrumentList",
                 {"fields": "id,name"},
             )
-        except DukascopyError:
+        except ProviderError:
             return False
 
         return True

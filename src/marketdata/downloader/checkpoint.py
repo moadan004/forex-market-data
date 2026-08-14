@@ -30,9 +30,12 @@ class ChunkCheckpoint(BaseModel):
     chunk_end: datetime
     status: ChunkStatus = ChunkStatus.PENDING
     attempts: int = 0
+    retries: int = 0
     row_count: int = 0
     files: list[str] = Field(default_factory=list)
     error: str | None = None
+    error_kind: str | None = None
+    retryable: bool | None = None
     completed_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -142,7 +145,10 @@ def _carry_over(
                 chunk_start=chunk.start,
                 chunk_end=chunk.end,
                 attempts=stored.attempts if stored else 0,
+                retries=stored.retries if stored else 0,
                 error=stored.error if stored else None,
+                error_kind=stored.error_kind if stored else None,
+                retryable=stored.retryable if stored else None,
             )
         )
 
@@ -263,6 +269,8 @@ def mark_running(checkpoint: DownloadCheckpoint, index: int) -> None:
     record.status = ChunkStatus.RUNNING
     record.attempts += 1
     record.error = None
+    record.error_kind = None
+    record.retryable = None
     record.updated_at = _now()
 
 
@@ -272,18 +280,42 @@ def mark_completed(
     *,
     row_count: int,
     files: list[Path],
+    retries: int = 0,
 ) -> None:
     record = checkpoint.record(index)
     record.status = ChunkStatus.COMPLETED
     record.row_count = row_count
     record.files = [str(path) for path in files]
+    record.retries += retries
     record.error = None
+    record.error_kind = None
+    record.retryable = None
     record.completed_at = _now()
     record.updated_at = record.completed_at
 
 
-def mark_failed(checkpoint: DownloadCheckpoint, index: int, error: str) -> None:
+def mark_failed(
+    checkpoint: DownloadCheckpoint,
+    index: int,
+    error: str,
+    *,
+    retries: int = 0,
+    error_kind: str | None = None,
+    retryable: bool | None = None,
+) -> None:
+    """
+    Record a chunk failure.
+
+    ``retries`` counts the provider-level retries spent on this attempt and
+    accumulates across runs; ``retryable`` records whether the failure that
+    finally stopped the chunk was transient — a chunk that exhausted its
+    retries reads differently from one that failed on the first permanent
+    error.
+    """
     record = checkpoint.record(index)
     record.status = ChunkStatus.FAILED
+    record.retries += retries
     record.error = error
+    record.error_kind = error_kind
+    record.retryable = retryable
     record.updated_at = _now()

@@ -60,6 +60,8 @@ src/marketdata/
 │   └── forex.py          Spot FX weekly session and holidays
 ├── providers/
 │   ├── base.py           MarketDataProvider abstraction
+│   ├── errors.py         Transient vs permanent failure classification
+│   ├── retry.py          Retry policy and executor
 │   └── dukascopy.py      Dukascopy implementation
 ├── normalization/
 │   └── timestamps.py     UTC normalization
@@ -136,6 +138,37 @@ By default a failing chunk is recorded and the run continues, so one bad
 window does not abandon the rest of a multi-year range; the command exits `1`
 and lists the failed chunks. `--strict` stops at the first failure instead.
 
+## Retries and error classification
+
+Every provider failure is classified before anything decides what to do with
+it. Only failures that can plausibly succeed on a second attempt are retried.
+
+| Classification | Covers | Retried |
+| --- | --- | --- |
+| `ProviderTimeoutError` | connect/read/pool timeouts, HTTP 408, 425 | yes |
+| `ProviderConnectionError` | connection refused or cut, truncated response | yes |
+| `ProviderRateLimitError` | HTTP 429, honouring `Retry-After` | yes |
+| `ProviderServerError` | HTTP 5xx | yes |
+| `ProviderAuthError` | HTTP 401, 403, proxy rejections | no |
+| `ProviderClientError` | HTTP 400 and other 4xx, malformed requests | no |
+| `ProviderDataError` | unknown symbol, unusable payload (`DukascopyError`) | no |
+
+A proxy refusing the tunnel is treated as permanent: an egress policy denial
+will not change however often it is asked.
+
+Retries wrap the whole HTTP exchange in the Dukascopy request layer, using
+`tenacity` with exponential backoff, so a 429 or a 5xx is retried the same
+way a dropped connection is. The attempt count is always bounded — a
+multi-year download makes thousands of requests, and an unbounded retry turns
+one unreachable provider into a run that never ends. `Retry-After` can extend
+a wait but never past the configured ceiling.
+
+Each chunk's checkpoint records how many retries it cost, the last error, the
+error class, and whether the failure that finally stopped it was transient —
+so a chunk that exhausted its retries reads differently from one that failed
+on the first permanent error. That history survives a restart and accumulates
+across runs.
+
 ## Partition merging
 
 Writing a month **merges** with whatever that partition already holds instead
@@ -186,12 +219,15 @@ UTC. The range is half-open: `--end` is exclusive.
 | `--manifest-root` | `data/manifests` | Manifest root |
 | `--quality-root` | `data/quality` | Quality report root |
 | `--checkpoint-root` | `data/checkpoints` | Resume checkpoint root |
+| `--retry-attempts` | `4` | Total attempts per provider request, including the first; `1` disables retries |
+| `--retry-backoff` | `1.0` | Seconds before the first retry, doubling thereafter |
+| `--retry-max-backoff` | `60.0` | Upper bound on the wait between retries |
 | `--strict` | off | Stop on the first failing or invalid chunk |
 | `--json` | off | Print the quality report as JSON |
 
 The command prints the provider, symbol, timeframe, calendar, requested and
-actual ranges, chunk progress, row counts at each stage, the quality status
-and the path of every artifact it wrote. It exits `1` when a chunk failed,
+actual ranges, chunk progress, row counts at each stage, the retries spent,
+the quality status and the path of every artifact it wrote. It exits `1` when a chunk failed,
 listing each failure, and rerunning the same command retries only those
 chunks.
 
@@ -341,17 +377,17 @@ For every stored dataset:
   `cadence_seconds: null` and an empty `missing_intervals`.
 - Quality reporting reads every stored timestamp in the requested range into
   memory. A seven-year one-minute range is a few million values.
-- A chunk is retried whole. There is no partial-chunk recovery and no
-  automatic retry within a single run — rerun the command.
-- There is no rate limiting. Requests are issued as fast as the download loop
-  allows, which is not yet suitable for a multi-year run against a free
-  endpoint.
+- A chunk is retried whole. There is no partial-chunk recovery: a chunk whose
+  retries are exhausted is re-fetched from its start on the next run.
+- There is no rate limiting. Retries back off after a 429, but nothing paces
+  requests in the first place, so a multi-year run against a free endpoint is
+  not yet advisable.
 
 ## Roadmap
 
 See [`planner.md`](planner.md) for the full phase breakdown, per-phase
 acceptance criteria, current blockers and the next milestone. In short: the
-ingestion path through resumable chunked downloads is complete; retry/backoff
-and rate limiting are next; live provider access is blocked by the
-development environment's egress policy; dataset acquisition, backtesting,
+ingestion path through resumable chunked downloads, retries and error
+classification is complete; rate limiting is next; live provider access is
+blocked by the development environment's egress policy; dataset acquisition, backtesting,
 analytics and the UI are planned and not started.
