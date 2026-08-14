@@ -21,6 +21,7 @@ from marketdata.downloader.chunks import (
 )
 from marketdata.normalization.timestamps import ensure_utc, normalize_candles
 from marketdata.providers.base import MarketDataProvider
+from marketdata.providers.errors import ProviderError
 from marketdata.quality.report import (
     QualityReport,
     build_quality_report,
@@ -47,6 +48,7 @@ class ChunkOutcome:
     out_of_range: int = 0
     duplicates: int = 0
     retained: int = 0
+    retries: int = 0
     files: list[Path] = field(default_factory=list)
     violations: list[CandleViolation] = field(default_factory=list)
     error: str | None = None
@@ -74,6 +76,7 @@ class DownloadResult:
     chunks_completed: int
     chunks_failed: int
     chunks_skipped: int
+    retries: int
     failures: list[str]
     files: list[Path]
     manifest: Path
@@ -190,6 +193,13 @@ class DownloadPipeline:
 
         outcome = ChunkOutcome(chunk=chunk)
 
+        # Provider retries are counted per chunk, so the checkpoint shows how
+        # much work each chunk really cost rather than a running total.
+        retry_stats = getattr(self.provider, "retry_stats", None)
+
+        if retry_stats is not None:
+            retry_stats.reset()
+
         try:
             # 1. Fetch this chunk from the provider.
             downloaded = self.provider.fetch_candles(
@@ -238,19 +248,31 @@ class DownloadPipeline:
                 timeframe=timeframe,
             )
         except Exception as exc:
-            if self.strict:
-                mark_failed(checkpoint, chunk.index, str(exc))
-                self.checkpoints.save(checkpoint)
-                raise
-
+            retries = retry_stats.retries if retry_stats is not None else 0
+            outcome.retries = retries
             outcome.error = f"{type(exc).__name__}: {exc}"
-            mark_failed(checkpoint, chunk.index, outcome.error)
+
+            mark_failed(
+                checkpoint,
+                chunk.index,
+                outcome.error,
+                retries=retries,
+                error_kind=type(exc).__name__,
+                retryable=(exc.retryable if isinstance(exc, ProviderError) else None),
+            )
+            self.checkpoints.save(checkpoint)
+
+            if self.strict:
+                raise
         else:
+            outcome.retries = retry_stats.retries if retry_stats is not None else 0
+
             mark_completed(
                 checkpoint,
                 chunk.index,
                 row_count=outcome.retained,
                 files=outcome.files,
+                retries=outcome.retries,
             )
 
         self.checkpoints.save(checkpoint)
@@ -343,6 +365,7 @@ class DownloadPipeline:
             chunks_completed=report.chunks_completed,
             chunks_failed=report.chunks_failed,
             chunks_skipped=skipped,
+            retries=sum(outcome.retries for outcome in outcomes),
             failures=[
                 f"chunk {outcome.chunk.index} "
                 f"({outcome.chunk.start:%Y-%m-%dT%H:%M:%SZ} -> "

@@ -37,7 +37,7 @@ against `src/` and `tests/` on the current branch.
 | 11 | API and UI | ⬜ |
 | 12 | Production | ⬜ |
 
-Test suite: **177 passing**. Ruff format and check: clean.
+Test suite: **253 passing**. Ruff format and check: clean.
 
 ---
 
@@ -130,9 +130,9 @@ honest about market closures.
 | Chunk planner | ✅ | `downloader/chunks.py` |
 | Checkpoint / resume | ✅ | `downloader/checkpoint.py` |
 | Partition merging | ✅ | `storage/parquet.py` |
-| Retry / backoff | ⬜ | **Not implemented.** `tenacity` is declared in `pyproject.toml` but unused |
+| Retry / backoff | ✅ | `providers/retry.py`, wired into the Dukascopy request layer |
+| Provider error classification | ✅ | `providers/errors.py` |
 | Rate limiting | ⬜ | **Not implemented.** No throttle, delay or concurrency limit exists |
-| Provider error classification | ⬜ | **Not implemented.** Every failure raises a single `DukascopyError`; transient (timeout, 5xx, 429) and permanent (unknown symbol, 4xx) are not distinguished |
 
 **Acceptance criteria**
 
@@ -146,14 +146,16 @@ honest about market closures.
 - A failing chunk does not corrupt the chunks that succeeded.
 - Chunk boundaries are deterministic and do not depend on the requested
   start.
-- *(outstanding)* A transient provider failure is retried with backoff
+- A transient provider failure is retried with exponential, bounded backoff
   instead of failing the chunk.
+- A permanent error fails fast instead of being retried.
+- Retry counts, the last error and whether the final failure was transient
+  are recorded in the checkpoint and survive a restart.
 - *(outstanding)* A long run stays within the provider's rate limits without
   manual pacing.
-- *(outstanding)* A permanent error fails fast instead of being retried.
 
-The first seven criteria are met and tested. The three marked outstanding
-belong to the unimplemented rows above and gate Phase 5.
+Every criterion except the last is met and tested. Rate limiting remains and
+gates Phase 5.
 
 ---
 
@@ -396,18 +398,14 @@ acquisition, independently of the environment blocker above.
 
 | Blocker | Why it gates acquisition |
 | --- | --- |
-| No retry / backoff | A seven-year run makes thousands of requests. Any transient failure currently fails that chunk and needs a manual rerun. |
-| No rate limiting | Nothing paces requests. A long run risks throttling or a ban from a free endpoint, and would be issued as fast as the loop allows. |
-| No provider error classification | Every failure is one `DukascopyError`, so a permanent error (unknown symbol) is indistinguishable from a transient one (timeout) and neither can be handled correctly. |
+| No rate limiting | Nothing paces requests. A long run risks throttling or a ban from a free endpoint, and requests are issued as fast as the download loop allows. Retries now back off after a 429, but nothing prevents reaching one. |
 
 ### Known inconsistencies
 
-- `tenacity` and `pydantic-settings` are declared as dependencies in
-  `pyproject.toml` but are not imported anywhere in `src/`. `tenacity` is
-  intended for retry/backoff (Phase 4) and `pydantic-settings` for
-  configuration. They are being kept rather than removed because the next
-  milestone uses `tenacity` directly; if retry/backoff lands on a different
-  library, both should be dropped.
+- `pydantic-settings` is declared as a dependency in `pyproject.toml` but is
+  not imported anywhere in `src/`. It is intended for configuration; drop it
+  if configuration lands another way. (`tenacity` was in the same position
+  and is now used by `providers/retry.py`.)
 
 ### Accepted limitations
 
@@ -430,17 +428,19 @@ the staged acquisition of Phase 5.
 
 | # | Milestone | Status | Done when |
 | --- | --- | --- | --- |
-| 1 | **Retry / backoff** | ⬜ next | A transient provider failure is retried with exponential backoff and a bounded attempt count; retries are recorded in the checkpoint; tests cover success-after-retry and exhaustion. |
-| 2 | **Rate limiting** | ⬜ | Requests are paced by a configurable limit; a long run cannot exceed it; the limit is a CLI option with a documented default. |
+| 1 | **Retry / backoff** | ✅ done | A transient provider failure is retried with exponential backoff and a bounded attempt count; retries are recorded in the checkpoint; tests cover success-after-retry and exhaustion. |
+| 2 | **Rate limiting** | ⬜ next | Requests are paced by a configurable limit; a long run cannot exceed it; the limit is a CLI option with a documented default. |
 | 3 | **Live provider verification** | 🔴 | The one-hour smoke test returns real candles from Dukascopy and the response matches the mocked assumptions, or the provider is corrected and regression tests are added. Blocked by egress policy. |
 | 4 | **One-day acquisition** | ⬜ | A full trading day of EUR/USD 1-minute data is stored with a quality report of `ok`. |
 | 5 | **One-month acquisition** | ⬜ | A calendar month is stored across multiple chunks; weekends appear as closures, not gaps. |
 | 6 | **One-year acquisition** | ⬜ | A year completes, survives at least one deliberate interruption and resume, and runtime is recorded. |
 | 7 | **5–7 year acquisition** | ⬜ | The target dataset is acquired per symbol and passes Phase 6 verification. |
 
-**Provider error classification** (Phase 4) is folded into milestone 1: retry
-logic cannot be written correctly without knowing which failures are
-transient.
+**Provider error classification** (Phase 4) was delivered with milestone 1:
+retry logic cannot be written correctly without knowing which failures are
+transient. Transient failures (timeouts, connection loss, 408, 425, 429, 5xx)
+are retried with exponential backoff; permanent ones (400, 401, 403, other
+4xx, proxy rejections, unusable payloads) fail on the first answer.
 
 Do not begin milestone 4 or later until milestone 3 has actually succeeded
 against the live provider. Mocked integration tests are not a substitute.
