@@ -306,7 +306,9 @@ class DownloadPipeline:
     ) -> DownloadResult:
         # The report describes what is on disk for the requested range, so a
         # resumed run reports the whole dataset and not only its own chunks.
-        timestamps = self.storage.read_timestamps(
+        # Streamed a partition at a time: a seven-year one-minute range holds
+        # millions of timestamps, and none of them need to be resident.
+        timestamps = self.storage.iter_timestamps(
             symbol=symbol,
             timeframe=timeframe,
             start=start,

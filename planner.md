@@ -47,7 +47,7 @@ diverge here:
 | 11 | API and UI | ⬜ |
 | 12 | Production | ⬜ |
 
-Test suite: **586 passing**. Ruff format and check: clean.
+Test suite: **636 passing**. Ruff format and check: clean.
 
 ---
 
@@ -256,9 +256,51 @@ remains is running them against a real acquired dataset, which Phase 5 gates.
 | Schema consistency across partitions | per-file schema comparison | ✅ | 🔴 |
 | Partition / file coverage | `ParquetStorage.partition_files` | ✅ | 🔴 |
 | Manifest agreement | claimed rows and files vs stored | ✅ | 🔴 |
-| Read-back validation | `ParquetStorage.read_table` / `read_candles` | ✅ | 🔴 |
+| Read-back validation | partition-at-a-time streaming scan | ✅ | 🔴 |
+| Misfiled partition rows | month claimed by the path vs the rows in it | ✅ | 🔴 |
+| Scales to the target dataset | bounded by partition, not dataset, size | ✅ | 🔴 |
 | Quality status classification | `quality/dataset.py` | ✅ | 🔴 |
 | Cross-provider comparison | `verification/comparison.py`, `marketdata compare` | ✅ | 🔴 |
+
+**Memory-bounded validation and quality reporting** — ✅ implemented and
+tested. Both paths now walk a dataset one partition at a time. A partition is
+read, judged, folded into running counters and dropped before the next is
+opened, so peak residency is one calendar month rather than the dataset. The
+target dataset — five to seven years of one-minute candles, several million
+rows — is the reason: a validator that materializes the range it judges
+cannot be run on the dataset it exists for.
+
+`ParquetStorage.partition_groups` is the single traversal every streaming
+consumer shares, so validation, quality reporting and cross-provider
+comparison all walk a dataset the same way rather than each deriving the
+layout again. `TradingGapScanner` is the incremental form of
+`find_missing_trading_intervals`, and the whole-list function is now a thin
+wrapper over it, so the two agree by construction. The range a dataset is
+judged against is resolved from Parquet footer statistics, so establishing
+the extent of a multi-year dataset costs a footer read per file and no rows
+at all.
+
+**What survives between partitions** is bounded and deliberate: the open
+trading sessions of the window, the last timestamp seen, the running
+counters, and at most twenty retained samples of each finding. Correctness
+across the boundary is preserved — a gap spanning two partitions is found
+exactly as one inside a single partition is, duplicates are counted a month
+at a time because the layout puts every row of a month in one file, and rows
+that break that layout are counted as `misfiled_rows` and reconciled against
+their home partition rather than assumed away.
+
+**Report equivalence** is tested rather than asserted: each report is
+recomputed the old whole-list way and the two are required to agree, across
+six dataset shapes and both calendars. Against the CSV fixture dataset the
+before/after JSON is field-for-field identical, with four fields added
+(`missing_interval_count`, `missing_intervals_truncated`,
+`duplicate_timestamps_truncated`, `misfiled_rows`) and none changed or
+removed.
+
+**One behaviour did change, deliberately.** `unordered_rows` was previously
+always zero: it was computed over a list the reader had already sorted, so
+it could never fire. Streaming reads partitions in path order, so a dataset
+whose partitions overlap in time now reports the disorder it actually has.
 
 **Cross-provider comparison tool** — ✅ implemented and tested.
 `marketdata compare` and `compare_datasets()` judge two *stored* datasets
@@ -336,6 +378,9 @@ a pipeline.
 - ✅ Any two stored datasets can be compared offline, within documented and
   configurable tolerances, producing a durable record that expires when
   anything it depended on changes.
+- ✅ Validating a dataset does not require holding it. Memory is bounded by
+  partition size, so the checks above can run against the multi-year target
+  dataset and not only against fixtures.
 - 🔴 A second provider agrees with **Dukascopy** on a sampled range. The
   comparison tool is built and tested, but one side of the comparison does
   not exist: no Dukascopy dataset has ever been acquired. Blocked by the
@@ -554,8 +599,18 @@ nothing about Dukascopy, whose behaviour remains mock-tested only.
   daylight saving; 21:00–22:00 UTC on Friday is treated as closed year-round.
 - Gap detection is skipped for timeframes without a constant cadence
   (`1day_eet`).
-- Quality reporting reads every stored timestamp in the requested range into
-  memory — a few million values for seven years of one-minute data.
+- Validation and quality reporting are bounded by partition size rather than
+  dataset size, and a partition is one calendar month — roughly 44,000
+  one-minute candles. That is a scaling property, not a fixed RAM figure.
+- Cross-partition duplicate detection is exact while every row sits in the
+  partition for its own month. Rows that do not are counted as
+  `misfiled_rows` and reconciled against their home partition, up to 1000
+  distinct timestamps; past that the report says the count is incomplete
+  rather than under-reporting silently.
+- Gap detection assumes chronological arrival, which the month-partitioned
+  layout guarantees. A dataset that breaks it reports non-zero
+  `unordered_rows` and `misfiled_rows` and grades `invalid`, so its gap
+  breakdown is advisory.
 - A chunk is retried whole; there is no partial-chunk recovery.
 - Cross-provider comparison matches gaps by exact interval equality, so two
   partially overlapping gaps are reported as unique to each side rather than
@@ -603,7 +658,8 @@ Do not begin milestone 4 or later until milestone 3 has actually succeeded
 against the live provider. Mocked integration tests are not a substitute.
 
 **Offline work that does not wait on milestone 3.** Cross-provider comparison
-(Phase 6) is complete and required no network. The comparison between a CSV
+and memory-bounded validation (both Phase 6) are complete and required no
+network. The comparison between a CSV
 dataset and a Dukascopy dataset — the actual cross-provider verification — is
 one command away and will run the moment a Dukascopy dataset exists:
 

@@ -407,8 +407,38 @@ uv run marketdata validate --symbol EUR/USD
 It reports the symbol, timeframe, checked and actual ranges, candles stored
 against candles expected, missing candles and the gaps that make them up,
 market closures, duplicates, invalid OHLC rows, out-of-range rows,
-out-of-order rows, the Parquet files making up the dataset, whether their
-schemas agree, and whether each manifest still matches what is stored.
+out-of-order rows, misfiled rows, the Parquet files making up the dataset,
+whether their schemas agree, and whether each manifest still matches what is
+stored.
+
+**It reads one partition at a time.** The dataset it exists for is five to
+seven years of one-minute candles — several million rows — so validation
+never materializes the range it is judging. Partitions are walked in
+chronological order; each is read, judged, folded into running counters and
+dropped before the next is opened. What survives between partitions is
+bounded: the open trading sessions of the window, the last timestamp seen,
+counters, and at most twenty retained samples of each kind of finding.
+Nothing in the report grows with the number of candles.
+
+That is what makes the checks below possible on the target dataset rather
+than only on a test fixture. Correctness across the boundary is preserved
+deliberately: a gap spanning two partitions is found exactly as one inside a
+single partition is, and duplicates are counted a month at a time because
+the layout puts every row of a month in one file.
+
+**Misfiled rows.** That layout is the invariant the streaming checks rest
+on, so it is checked rather than assumed. A row stored in the partition for
+another month is counted as `misfiled_rows`, reported as a problem, and
+graded `invalid` — and because such a row is the one way a timestamp can
+appear in two partitions, each one is reconciled against the partition it
+should have been in so the duplicate count stays exact.
+
+**Bounded samples.** `missing_intervals`, `violations` and
+`duplicate_timestamps` each retain at most twenty entries, alongside exact
+counts (`missing_interval_count`, `invalid_rows`, `duplicate_candles`) and a
+`*_truncated` flag. A badly broken multi-year dataset can hold a gap per
+candle; a report that grows with the defect could not be written for the
+dataset that most needs one.
 
 **Which window is it judged against?** An explicit `--start`/`--end` wins.
 Otherwise the manifests say what was meant to be acquired, which is the
@@ -793,6 +823,15 @@ the quality report, Parquet round-tripping, cross-provider comparison over two
 independent CSV feeds acquired through the real pipeline, and the CLI end to
 end for fresh, failed and resumed runs.
 
+Streaming validation is held to two separate promises. That it is bounded is
+tested deterministically rather than by measuring process memory: the
+partition reader is instrumented, the whole-range reads are replaced with
+assertions that fail if called, and the tests check that partitions are read
+once each in chronological order and that the largest resident batch is one
+partition regardless of dataset size. That it is *correct* is tested by
+recomputing each report the old whole-list way and requiring the two to
+agree, across six dataset shapes and both calendars.
+
 ## Data-quality guarantees
 
 For every stored dataset:
@@ -838,8 +877,20 @@ For every stored dataset:
 - Gap detection is skipped for timeframes without a constant spacing;
   `1day_eet` shifts across daylight-saving transitions. Such reports carry
   `cadence_seconds: null` and an empty `missing_intervals`.
-- Quality reporting reads every stored timestamp in the requested range into
-  memory. A seven-year one-minute range is a few million values.
+- Validation and quality reporting are bounded by **partition** size, not
+  dataset size, and one partition is one calendar month. A month of
+  one-minute candles is roughly 44,000 rows; that, not the dataset, is the
+  working set. This is a scaling property, not a fixed RAM figure — a
+  coarser partitioning or a much denser timeframe would raise it.
+- Cross-partition duplicate detection is exact while every row is stored in
+  the partition for its own month. Rows that are not are counted as
+  `misfiled_rows` and reconciled against their home partition, up to
+  `MAX_TRACKED_MISFILED` (1000) distinct timestamps, beyond which the report
+  says so rather than under-counting silently.
+- Gap detection assumes timestamps arrive chronologically, which the
+  month-partitioned layout guarantees. A dataset that violates it reports
+  non-zero `unordered_rows` and `misfiled_rows` and is graded `invalid`, so
+  its gap breakdown is advisory rather than authoritative.
 - A chunk is retried whole. There is no partial-chunk recovery: a chunk whose
   retries are exhausted is re-fetched from its start on the next run.
 - The rate limit is per process. Two downloads started separately do not
@@ -867,7 +918,8 @@ acceptance criteria, current blockers and the next milestone. In short: the
 ingestion path through resumable chunked downloads, retries, error
 classification and rate limiting is complete, as are offline dataset
 validation, the staged acquisition workflow that gates a large download on
-verified smaller ones, and offline cross-provider comparison of two stored
-datasets; live provider verification is next and is blocked
+verified smaller ones, offline cross-provider comparison of two stored
+datasets, and validation and quality reporting that scale to the multi-year
+target dataset; live provider verification is next and is blocked
 by the development environment's egress policy; dataset acquisition, backtesting,
 analytics and the UI are planned and not started.

@@ -708,12 +708,13 @@ def format_validation(report: DatasetValidationReport) -> str:
     lines.extend(
         [
             f"Missing candles:   {report.missing_candles}",
-            f"Detected gaps:     {len(report.missing_intervals)}",
+            f"Detected gaps:     {report.missing_interval_count}",
             f"Market closures:   {len(report.market_closed_intervals)}",
             f"Duplicate candles: {report.duplicate_candles}",
             f"Invalid OHLC rows: {report.invalid_rows}",
             f"Out of range rows: {report.out_of_range_rows}",
             f"Unordered rows:    {report.unordered_rows}",
+            f"Misfiled rows:     {report.misfiled_rows}",
             f"Parquet files:     {report.files}",
             f"Schema consistent: {'yes' if report.schema_consistent else 'no'}",
             f"Manifests:         {len(report.manifests)}",
@@ -740,9 +741,9 @@ def format_validation(report: DatasetValidationReport) -> str:
             f" ({interval.missing_candles} candles)"
         )
 
-    if len(report.missing_intervals) > MAX_LISTED_GAPS:
+    if report.missing_interval_count > MAX_LISTED_GAPS:
         lines.append(
-            f"  ... and {len(report.missing_intervals) - MAX_LISTED_GAPS} more gaps"
+            f"  ... and {report.missing_interval_count - MAX_LISTED_GAPS} more gaps"
         )
 
     return "\n".join(lines)

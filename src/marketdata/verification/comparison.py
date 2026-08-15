@@ -15,7 +15,6 @@ from marketdata.models.timeframe import timeframe_cadence
 from marketdata.quality.dataset import (
     UNREADABLE_DATASET_ERRORS,
     load_manifests,
-    partition_key,
     schema_differences,
 )
 from marketdata.quality.gaps import MissingInterval, find_missing_intervals
@@ -455,39 +454,17 @@ def partition_batches(
     therefore exact, and it bounds the working set to a month of candles
     rather than a whole multi-year history.
     """
-    left_groups = _group_partitions(
-        left, symbol=symbol, timeframe=timeframe, start=start, end=end
+    left_groups = dict(
+        left.partition_groups(symbol=symbol, timeframe=timeframe, start=start, end=end)
     )
-    right_groups = _group_partitions(
-        right, symbol=symbol, timeframe=timeframe, start=start, end=end
+    right_groups = dict(
+        right.partition_groups(symbol=symbol, timeframe=timeframe, start=start, end=end)
     )
 
     return [
         (key, left_groups.get(key, []), right_groups.get(key, []))
         for key in sorted(set(left_groups) | set(right_groups))
     ]
-
-
-def _group_partitions(
-    storage: ParquetStorage,
-    *,
-    symbol: str,
-    timeframe: str,
-    start: datetime | None,
-    end: datetime | None,
-) -> dict[tuple[int, int], list[Path]]:
-    groups: dict[tuple[int, int], list[Path]] = {}
-
-    for path in storage.partition_files(
-        symbol=symbol,
-        timeframe=timeframe,
-        start=start,
-        end=end,
-    ):
-        year, month = partition_key(path)
-        groups.setdefault((year or 0, month or 0), []).append(path)
-
-    return groups
 
 
 class _GapTracker:

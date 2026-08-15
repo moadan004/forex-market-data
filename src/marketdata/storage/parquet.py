@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
@@ -11,6 +12,13 @@ import pyarrow.parquet as pq
 
 from marketdata.models.candle import Candle
 from marketdata.validation.candles import merge_candles
+
+UNREADABLE_STORAGE_ERRORS = (pa.ArrowException, OSError, ValueError)
+"""What opening or decoding a damaged Parquet file can raise.
+
+Metadata inspection is used to describe datasets that may be damaged, so a
+truncated footer or a missing file has to be answerable rather than fatal.
+"""
 
 PRICE_SCALE = 8
 PRICE_PRECISION = 18
@@ -47,7 +55,7 @@ def normalize_symbol_path(symbol: str) -> str:
     return symbol.strip().upper().replace("/", "_")
 
 
-def _partition_month(path: Path) -> tuple[int, int] | None:
+def partition_month(path: Path) -> tuple[int, int] | None:
     """Read the year and month out of a hive-partitioned file path."""
     parts = {
         piece.split("=", 1)[0]: piece.split("=", 1)[1]
@@ -70,7 +78,7 @@ def _partition_overlaps(
     if start is None and end is None:
         return True
 
-    month = _partition_month(path)
+    month = partition_month(path)
 
     if month is None:
         # An unrecognized layout is never silently excluded; validation
@@ -90,6 +98,14 @@ def _partition_overlaps(
         return False
 
     return not (start is not None and month_end <= start)
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Normalize a timestamp read from Parquet metadata to UTC."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+
+    return value.astimezone(UTC)
 
 
 def _quantize(value: Decimal, quantum: Decimal) -> Decimal:
@@ -250,7 +266,42 @@ class ParquetStorage:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def read_partition(self, path: str | Path) -> list[Candle]:
+    def partition_groups(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> list[tuple[tuple[int, int], list[Path]]]:
+        """
+        Return the partition files grouped by the month they hold, in order.
+
+        This is the traversal every streaming consumer shares — validation,
+        quality reporting and cross-provider comparison all walk a dataset
+        this way rather than each deriving the layout again. A month is one
+        group even when several files claim it, and files whose path carries
+        no recognizable month are grouped under ``(0, 0)`` so they are
+        scanned rather than silently skipped.
+        """
+        groups: dict[tuple[int, int], list[Path]] = {}
+
+        for path in self.partition_files(
+            symbol=symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+        ):
+            groups.setdefault(partition_month(path) or (0, 0), []).append(path)
+
+        return sorted(groups.items())
+
+    def read_partition(
+        self,
+        path: str | Path,
+        *,
+        columns: Sequence[str] | None = None,
+    ) -> list[Candle]:
         """
         Read a single partition file.
 
@@ -258,7 +309,98 @@ class ParquetStorage:
         keeps the working set to a month of candles rather than the whole
         history.
         """
-        return table_to_candles(pq.read_table(Path(path)))
+        return table_to_candles(pq.read_table(Path(path), columns=columns))
+
+    @staticmethod
+    def partition_timestamps(path: str | Path) -> list[datetime]:
+        """
+        Read only the timestamp column of one partition, in order.
+
+        Coverage analysis needs when candles exist, not what they were
+        worth, and skipping the five decimal columns is most of the file.
+        """
+        table = pq.read_table(Path(path), columns=["timestamp"])
+
+        return sorted(table.column("timestamp").to_pylist())
+
+    @staticmethod
+    def partition_bounds(path: str | Path) -> tuple[datetime, datetime] | None:
+        """
+        Return a partition's first and last timestamp without reading it.
+
+        Parquet records per-column minima and maxima in the footer, so the
+        extent of a multi-year dataset can be established from metadata
+        alone. Statistics are optional, so a file without them falls back to
+        reading its timestamp column — one partition, never the dataset.
+        """
+        target = Path(path)
+
+        try:
+            metadata = pq.read_metadata(target)
+            index = metadata.schema.names.index("timestamp")
+        except UNREADABLE_STORAGE_ERRORS:
+            return None
+
+        low: datetime | None = None
+        high: datetime | None = None
+
+        for group in range(metadata.num_row_groups):
+            statistics = metadata.row_group(group).column(index).statistics
+
+            if statistics is None or not statistics.has_min_max:
+                low = high = None
+                break
+
+            low = statistics.min if low is None else min(low, statistics.min)
+            high = statistics.max if high is None else max(high, statistics.max)
+
+        if low is not None and high is not None:
+            return _as_utc(low), _as_utc(high)
+
+        try:
+            stamps = ParquetStorage.partition_timestamps(target)
+        except UNREADABLE_STORAGE_ERRORS:
+            return None
+
+        if not stamps:
+            return None
+
+        return stamps[0], stamps[-1]
+
+    def iter_timestamps(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> Iterator[datetime]:
+        """
+        Yield the stored timestamps in order, one partition at a time.
+
+        The streaming counterpart of :meth:`read_timestamps`: only the
+        current partition's timestamps are resident, so coverage analysis of
+        a multi-year one-minute dataset costs a month of values rather than
+        millions.
+        """
+        for _, paths in self.partition_groups(
+            symbol=symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+        ):
+            stamps = sorted(
+                stamp for path in paths for stamp in self.partition_timestamps(path)
+            )
+
+            for stamp in stamps:
+                if start is not None and stamp < start:
+                    continue
+
+                if end is not None and stamp >= end:
+                    continue
+
+                yield stamp
 
     def read_table(
         self,
@@ -336,14 +478,15 @@ class ParquetStorage:
         """
         Read only the timestamps of a stored dataset, in order.
 
-        Quality reporting needs the coverage of a dataset rather than its
-        prices, and a multi-year range holds millions of rows.
+        Materializes the whole range. Prefer :meth:`iter_timestamps` for
+        anything that only needs one pass — a multi-year one-minute range
+        holds millions of values.
         """
-        table = self.read_table(
-            symbol=symbol,
-            timeframe=timeframe,
-            start=start,
-            end=end,
+        return list(
+            self.iter_timestamps(
+                symbol=symbol,
+                timeframe=timeframe,
+                start=start,
+                end=end,
+            )
         )
-
-        return table.column("timestamp").to_pylist()
