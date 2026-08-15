@@ -47,7 +47,7 @@ diverge here:
 | 11 | API and UI | ⬜ |
 | 12 | Production | ⬜ |
 
-Test suite: **402 passing**. Ruff format and check: clean.
+Test suite: **485 passing**. Ruff format and check: clean.
 
 ---
 
@@ -187,19 +187,42 @@ provider. See *Current blockers*.
 | Timeframe | 1-minute |
 | Symbols | EUR/USD, GBP/USD, USD/JPY, XAU/USD |
 
-**Staged acquisition.** Each stage must pass its quality report before the
-next is attempted. No stage may be skipped.
+**Staged acquisition.** Each stage must pass before the next is attempted.
+No stage may be skipped — this is now enforced by the code, not by
+discipline.
 
-| Stage | Range | Status | Purpose |
+| Stage | Range | Tooling | Run against Dukascopy |
 | --- | --- | --- | --- |
-| 1 | 1 hour | 🔴 | Confirm live connectivity, response shape, timestamp alignment |
-| 2 | 1 day | ⬜ | Confirm a full session, including the daily boundary |
-| 3 | 1 month | ⬜ | Confirm weekend handling and multi-chunk merging |
-| 4 | 1 year | ⬜ | Confirm resume behaviour, rate limits and runtime at scale |
-| 5 | 5–7 years | ⬜ | Acquire the target dataset, one symbol at a time |
+| `smoke` | 1 hour | ✅ implemented, offline tested | 🔴 |
+| `daily` | 1 trading day | ✅ implemented, offline tested | 🔴 |
+| `monthly` | 1 calendar month | ✅ implemented, offline tested | 🔴 |
+| `historical` | arbitrary, incl. 5–7 years | ✅ implemented, offline tested | 🔴 |
+
+**Readiness machinery** — ✅ implemented and offline tested
+(`src/marketdata/verification/`):
+
+| Capability | Module | Note |
+| --- | --- | --- |
+| Provider preflight | `preflight.py` | reachability, symbol, timeframe, candles, parsing, UTC, OHLC, pagination stitching |
+| Stage definitions | `stages.py` | smoke → daily → monthly → historical |
+| Quality thresholds | `status.py` | PASS / WARN / FAIL / BLOCKED; structural defects never tolerated |
+| Verification records | `records.py` | durable evidence, invalidated by a changed provider configuration |
+| Safety guard | `guard.py` | a download longer than a month is refused without evidence |
+| Stage runner | `runner.py` | runs the production pipeline, then re-validates from disk |
+| Provenance | `storage/manifest.py` | how a dataset came to exist; never records a credential |
+
+`BLOCKED` is tracked separately from `FAIL` throughout: a policy denial is
+not evidence that anything is broken, and must never be mistaken for a
+verification.
 
 **Acceptance criteria**
 
+- ✅ A stage cannot run before its smaller stages have been verified, and a
+  historical download is refused without all three.
+- ✅ Verification means re-inspecting the stored dataset, not a zero exit
+  code.
+- ✅ An override exists, is explicit, and is recorded in the data's
+  provenance.
 - Each stage's quality report has status `ok`, or every deviation is
   explained and accepted before proceeding.
 - Chunk sizing and runtime are recorded at stage 4 and used to estimate
@@ -441,6 +464,21 @@ blocker rather than missing code.
   if configuration lands another way. (`tenacity` was in the same position
   and is now used by `providers/retry.py`.)
 
+### Live status
+
+One `provider-check` was attempted against the real Dukascopy endpoint on
+the current branch. It returned:
+
+```text
+BLOCKED  reachable: refused by policy or credentials:
+         Dukascopy request failed for instrumentList: 403 Forbidden (proxy rejected)
+Result:  BLOCKED
+```
+
+This is **not** a verification and is not recorded as one. No verification
+record exists for any Dukascopy stage, and the safety guard therefore
+refuses a historical Dukascopy download — which is the intended behaviour.
+
 ### Offline coverage
 
 The ingestion path is exercised end to end without a network by the CSV
@@ -472,7 +510,7 @@ the staged acquisition of Phase 5.
 | --- | --- | --- | --- |
 | 1 | **Retry / backoff** | ✅ done | A transient provider failure is retried with exponential backoff and a bounded attempt count; retries are recorded in the checkpoint; tests cover success-after-retry and exhaustion. |
 | 2 | **Rate limiting** | ✅ done | Requests are paced by a configurable limit; a long run cannot exceed it; the limit is a CLI option with a documented default. |
-| 3 | **Live provider verification** | 🔴 next | The one-hour smoke test returns real candles from Dukascopy and the response matches the mocked assumptions, or the provider is corrected and regression tests are added. Blocked by egress policy. |
+| 3 | **Live provider verification** | 🔴 next | Run `marketdata provider-check` and `verify-stage --stage smoke` against the real endpoint. The tooling is built and offline tested; only network access is missing. The one-hour smoke test returns real candles from Dukascopy and the response matches the mocked assumptions, or the provider is corrected and regression tests are added. Blocked by egress policy. |
 | 4 | **One-day acquisition** | ⬜ | A full trading day of EUR/USD 1-minute data is stored with a quality report of `ok`. |
 | 5 | **One-month acquisition** | ⬜ | A calendar month is stored across multiple chunks; weekends appear as closures, not gaps. |
 | 6 | **One-year acquisition** | ⬜ | A year completes, survives at least one deliberate interruption and resume, and runtime is recorded. |

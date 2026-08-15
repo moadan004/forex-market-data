@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 
@@ -20,6 +21,17 @@ from marketdata.providers.retry import (
 )
 from marketdata.quality.dataset import DatasetValidationReport, validate_dataset
 from marketdata.quality.report import QualityStatus
+from marketdata.verification.guard import check_download
+from marketdata.verification.preflight import PreflightReport, check_provider
+from marketdata.verification.records import VerificationStore
+from marketdata.verification.runner import StageOutcome, run_stage
+from marketdata.verification.stages import STAGE_DESCRIPTIONS, Stage
+from marketdata.verification.status import (
+    DEFAULT_MISSING_FAIL_RATIO,
+    DEFAULT_MISSING_WARN_RATIO,
+    QualityThresholds,
+    VerificationStatus,
+)
 
 ProviderFactory = Callable[[], MarketDataProvider]
 
@@ -49,6 +61,82 @@ def chunk_size(value: str) -> ChunkSize:
         return parse_chunk_size(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _add_storage_options(parser: argparse.ArgumentParser) -> None:
+    """Add the directories every artifact-writing command shares."""
+    parser.add_argument(
+        "--data-root",
+        "--output-root",
+        default="data/processed",
+        dest="data_root",
+        help="Root directory for Parquet output. Default: data/processed.",
+    )
+    parser.add_argument(
+        "--manifest-root",
+        default="data/manifests",
+        help="Root directory for manifests. Default: data/manifests.",
+    )
+    parser.add_argument(
+        "--quality-root",
+        default="data/quality",
+        help="Root directory for quality reports. Default: data/quality.",
+    )
+    parser.add_argument(
+        "--checkpoint-root",
+        default="data/checkpoints",
+        help="Root directory for resume checkpoints. Default: data/checkpoints.",
+    )
+    parser.add_argument(
+        "--verification-root",
+        default="data/verification",
+        help="Root directory for verification records. Default: data/verification.",
+    )
+
+
+def _add_rate_limit_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--rate-limit",
+        type=float,
+        default=DEFAULT_REQUESTS_PER_SECOND,
+        metavar="REQUESTS_PER_SECOND",
+        help=(
+            "Maximum outbound provider requests per second, applied to every "
+            "request including retries. Equivalent to a minimum interval of "
+            "1/RATE seconds between requests. There is no unlimited setting. "
+            f"Default: {DEFAULT_REQUESTS_PER_SECOND:g}."
+        ),
+    )
+
+
+def _add_retry_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--retry-attempts",
+        type=int,
+        default=DEFAULT_ATTEMPTS,
+        help=(
+            "Total attempts per provider request, including the first. "
+            f"1 disables retries. Default: {DEFAULT_ATTEMPTS}."
+        ),
+    )
+    parser.add_argument(
+        "--retry-backoff",
+        type=float,
+        default=DEFAULT_BACKOFF_SECONDS,
+        help=(
+            "Seconds to wait before the first retry, doubling thereafter. "
+            f"Default: {DEFAULT_BACKOFF_SECONDS}."
+        ),
+    )
+    parser.add_argument(
+        "--retry-max-backoff",
+        type=float,
+        default=DEFAULT_MAX_BACKOFF_SECONDS,
+        help=(
+            "Upper bound on the wait between retries. "
+            f"Default: {DEFAULT_MAX_BACKOFF_SECONDS}."
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -129,65 +217,15 @@ def build_parser() -> argparse.ArgumentParser:
         dest="resume",
         help="Ignore saved progress and download every chunk again.",
     )
+    _add_storage_options(download)
+    _add_rate_limit_option(download)
+    _add_retry_options(download)
     download.add_argument(
-        "--data-root",
-        "--output-root",
-        default="data/processed",
-        dest="data_root",
-        help="Root directory for Parquet output. Default: data/processed.",
-    )
-    download.add_argument(
-        "--manifest-root",
-        default="data/manifests",
-        help="Root directory for manifests. Default: data/manifests.",
-    )
-    download.add_argument(
-        "--quality-root",
-        default="data/quality",
-        help="Root directory for quality reports. Default: data/quality.",
-    )
-    download.add_argument(
-        "--checkpoint-root",
-        default="data/checkpoints",
-        help="Root directory for resume checkpoints. Default: data/checkpoints.",
-    )
-    download.add_argument(
-        "--rate-limit",
-        type=float,
-        default=DEFAULT_REQUESTS_PER_SECOND,
-        metavar="REQUESTS_PER_SECOND",
+        "--force-unverified",
+        action="store_true",
         help=(
-            "Maximum outbound provider requests per second, applied to every "
-            "request including retries. Equivalent to a minimum interval of "
-            "1/RATE seconds between requests. There is no unlimited setting. "
-            f"Default: {DEFAULT_REQUESTS_PER_SECOND:g}."
-        ),
-    )
-    download.add_argument(
-        "--retry-attempts",
-        type=int,
-        default=DEFAULT_ATTEMPTS,
-        help=(
-            "Total attempts per provider request, including the first. "
-            f"1 disables retries. Default: {DEFAULT_ATTEMPTS}."
-        ),
-    )
-    download.add_argument(
-        "--retry-backoff",
-        type=float,
-        default=DEFAULT_BACKOFF_SECONDS,
-        help=(
-            "Seconds to wait before the first retry, doubling thereafter. "
-            f"Default: {DEFAULT_BACKOFF_SECONDS}."
-        ),
-    )
-    download.add_argument(
-        "--retry-max-backoff",
-        type=float,
-        default=DEFAULT_MAX_BACKOFF_SECONDS,
-        help=(
-            "Upper bound on the wait between retries. "
-            f"Default: {DEFAULT_MAX_BACKOFF_SECONDS}."
+            "Run a historical acquisition whose smaller stages are unproven. "
+            "Recorded in the dataset provenance so the data carries the fact."
         ),
     )
     download.add_argument(
@@ -272,6 +310,138 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="as_json",
         help="Print the validation report as JSON instead of a text summary.",
+    )
+
+    preflight = subparsers.add_parser(
+        "provider-check",
+        help="Ask a provider whether it can supply usable data at all.",
+    )
+
+    preflight.add_argument(
+        "--provider",
+        default="dukascopy",
+        choices=PROVIDERS,
+        help="Provider to question. Default: dukascopy.",
+    )
+    preflight.add_argument(
+        "--source",
+        help="CSV file or directory; required for --provider csv.",
+    )
+    preflight.add_argument("--symbol", required=True, help="Symbol to ask for.")
+    preflight.add_argument(
+        "--timeframe",
+        default="1min",
+        help="Timeframe to ask for. Default: 1min.",
+    )
+    preflight.add_argument(
+        "--start",
+        type=parse_datetime,
+        help="UTC start of the window to sample. Defaults to a recent window.",
+    )
+    preflight.add_argument(
+        "--end",
+        type=parse_datetime,
+        help="UTC end of the window to sample (exclusive).",
+    )
+    _add_retry_options(preflight)
+    _add_rate_limit_option(preflight)
+    preflight.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Print the preflight report as JSON instead of a text summary.",
+    )
+
+    verify = subparsers.add_parser(
+        "verify-stage",
+        help="Acquire one staged range through the pipeline and verify it.",
+    )
+
+    verify.add_argument(
+        "--stage",
+        required=True,
+        choices=[stage.value for stage in Stage],
+        help="; ".join(
+            f"{stage.value}: {description}"
+            for stage, description in STAGE_DESCRIPTIONS.items()
+        ),
+    )
+    verify.add_argument(
+        "--provider",
+        default="dukascopy",
+        choices=PROVIDERS,
+        help="Provider to acquire from. Default: dukascopy.",
+    )
+    verify.add_argument(
+        "--source",
+        help="CSV file or directory; required for --provider csv.",
+    )
+    verify.add_argument("--symbol", required=True, help="Symbol to acquire.")
+    verify.add_argument(
+        "--timeframe",
+        default="1min",
+        help="Timeframe to acquire. Default: 1min.",
+    )
+    verify.add_argument(
+        "--start",
+        required=True,
+        type=parse_datetime,
+        help="UTC start of the stage window.",
+    )
+    verify.add_argument(
+        "--end",
+        type=parse_datetime,
+        help=(
+            "UTC end, exclusive. Only for --stage historical; the smaller "
+            "stages decide their own end."
+        ),
+    )
+    verify.add_argument(
+        "--chunk-size",
+        default="1month",
+        type=chunk_size,
+        help="Size of each provider request. Default: 1month.",
+    )
+    verify.add_argument(
+        "--calendar",
+        default="forex",
+        choices=sorted(CALENDARS),
+        help="Trading calendar. Default: forex.",
+    )
+    verify.add_argument(
+        "--missing-warn-ratio",
+        type=float,
+        default=DEFAULT_MISSING_WARN_RATIO,
+        help=(
+            "Fraction of expected candles that may be missing before warning. "
+            f"Default: {DEFAULT_MISSING_WARN_RATIO}."
+        ),
+    )
+    verify.add_argument(
+        "--missing-fail-ratio",
+        type=float,
+        default=DEFAULT_MISSING_FAIL_RATIO,
+        help=(
+            "Fraction of expected candles that may be missing before failing. "
+            f"Default: {DEFAULT_MISSING_FAIL_RATIO}."
+        ),
+    )
+    verify.add_argument(
+        "--force-unverified",
+        action="store_true",
+        help=(
+            "Run a stage whose prerequisites are unproven. Recorded in the "
+            "dataset provenance so the data carries the fact."
+        ),
+    )
+    _add_retry_options(verify)
+    _add_rate_limit_option(verify)
+    _add_storage_options(verify)
+    verify.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Print the verification record as JSON instead of a text summary.",
     )
 
     return parser
@@ -425,6 +595,190 @@ def run_validate(args: argparse.Namespace) -> int:
     return 1
 
 
+def format_preflight(report: PreflightReport, *, live: bool) -> str:
+    """Render a human-readable preflight summary."""
+    lines = [
+        f"Provider:          {report.provider}",
+        f"Symbol:            {report.symbol}",
+        f"Timeframe:         {report.timeframe}",
+        (
+            f"Sampled range:     {_format_timestamp(report.start)}"
+            f" -> {_format_timestamp(report.end)}"
+        ),
+        f"Candles:           {report.candles}",
+        "Checks:",
+    ]
+
+    lines.extend(
+        f"  {check.status.value.upper():<8} {check.name}: {check.detail}"
+        for check in report.checks
+    )
+
+    lines.append(f"Result:            {report.status.value.upper()}")
+
+    if report.blocked:
+        lines.append(
+            "The provider could not be reached, which is not the same as the "
+            "provider being wrong. Nothing has been verified."
+        )
+
+    if not live:
+        lines.append(
+            "NOTE: this ran against a stub transport, so it proves the client "
+            "code and not the provider."
+        )
+
+    return "\n".join(lines)
+
+
+def run_provider_check(
+    args: argparse.Namespace,
+    *,
+    provider_factory: ProviderFactory | None = None,
+) -> int:
+    live = provider_factory is None
+    provider = (provider_factory or (lambda: provider_from_args(args)))()
+
+    try:
+        report = check_provider(
+            provider,
+            symbol=args.symbol,
+            timeframe=args.timeframe,
+            start=args.start,
+            end=args.end,
+        )
+    finally:
+        close = getattr(provider, "close", None)
+
+        if callable(close):
+            close()
+
+    if args.as_json:
+        print(report.model_dump_json(indent=2))
+    else:
+        print(format_preflight(report, live=live))
+
+    return 0 if report.passed else 1
+
+
+def format_stage(outcome: StageOutcome) -> str:
+    """Render a human-readable summary of one staged verification."""
+    record = outcome.record
+    validation = outcome.validation
+    result = outcome.result
+
+    lines = [
+        f"Provider:          {result.provider if result else '-'}",
+        f"Symbol:            {record.symbol if record else '-'}",
+        f"Timeframe:         {record.timeframe if record else '-'}",
+        f"Stage:             {outcome.stage.value}",
+    ]
+
+    if result is not None:
+        lines.extend(
+            [
+                (
+                    f"Requested range:   "
+                    f"{_format_timestamp(result.requested_start)}"
+                    f" -> {_format_timestamp(result.requested_end)}"
+                ),
+                (
+                    f"Actual range:      {_format_timestamp(result.actual_start)}"
+                    f" -> {_format_timestamp(result.actual_end)}"
+                ),
+                f"Rows:              {result.retained_count}",
+                f"Quality status:    {result.quality.status.value}",
+            ]
+        )
+
+    if validation is not None:
+        lines.extend(
+            [
+                f"Expected rows:     {validation.expected_candles}",
+                f"Missing candles:   {validation.missing_candles}",
+                f"Market closures:   {len(validation.market_closed_intervals)}",
+                f"Validation status: {validation.status.value}",
+            ]
+        )
+
+    lines.append(f"Prerequisites:     {outcome.guard.reason}")
+    lines.append(f"Verification:      {outcome.status.value.upper()}")
+
+    if outcome.record_path is not None:
+        lines.append(f"Record:            {outcome.record_path}")
+
+    if outcome.problems:
+        lines.append("Problems:")
+        lines.extend(f"  - {problem}" for problem in outcome.problems)
+
+    if outcome.status is VerificationStatus.BLOCKED:
+        lines.append(
+            "BLOCKED is not a failure of the data and not a verification. "
+            "Nothing has been proven."
+        )
+
+    return "\n".join(lines)
+
+
+def thresholds_from_args(args: argparse.Namespace) -> QualityThresholds:
+    return QualityThresholds(
+        missing_warn_ratio=args.missing_warn_ratio,
+        missing_fail_ratio=args.missing_fail_ratio,
+    )
+
+
+def run_verify_stage(
+    args: argparse.Namespace,
+    *,
+    provider_factory: ProviderFactory | None = None,
+) -> int:
+    live = provider_factory is None
+    provider = (provider_factory or (lambda: provider_from_args(args)))()
+
+    try:
+        outcome = run_stage(
+            provider,
+            stage=Stage(args.stage),
+            symbol=args.symbol,
+            start=args.start,
+            end=args.end,
+            timeframe=args.timeframe,
+            data_root=args.data_root,
+            manifest_root=args.manifest_root,
+            quality_root=args.quality_root,
+            checkpoint_root=args.checkpoint_root,
+            verification_root=args.verification_root,
+            calendar=get_calendar(args.calendar),
+            chunk_size=args.chunk_size,
+            thresholds=thresholds_from_args(args),
+            live=live,
+            override=args.force_unverified,
+        )
+    finally:
+        close = getattr(provider, "close", None)
+
+        if callable(close):
+            close()
+
+    if args.as_json and outcome.record is not None:
+        print(outcome.record.model_dump_json(indent=2))
+    elif args.as_json:
+        print(
+            json.dumps(
+                {
+                    "stage": outcome.stage.value,
+                    "status": outcome.status.value,
+                    "problems": outcome.problems,
+                },
+                indent=2,
+            )
+        )
+    else:
+        print(format_stage(outcome))
+
+    return 0 if outcome.verified else 1
+
+
 def rate_limit_from_args(args: argparse.Namespace) -> RateLimit:
     """Build the rate limit the provider should honour."""
     return RateLimit(requests_per_second=args.rate_limit)
@@ -465,6 +819,37 @@ def run_download(
 
     provider = provider_factory()
 
+    guard = check_download(
+        VerificationStore(args.verification_root),
+        provider=provider.name,
+        configuration=provider.configuration(),
+        symbol=args.symbol,
+        timeframe=args.timeframe,
+        start=args.start,
+        end=args.end,
+        override=args.force_unverified,
+    )
+
+    if not guard.allowed:
+        close = getattr(provider, "close", None)
+
+        if callable(close):
+            close()
+
+        print(f"refused: {guard.reason}")
+        print(
+            "Verify the smaller stages first, for example:\n"
+            f"  marketdata verify-stage --stage smoke --symbol {args.symbol}"
+            f" --start {args.start:%Y-%m-%dT%H:%M:%SZ}\n"
+            "or pass --force-unverified to proceed anyway, which is recorded "
+            "in the dataset provenance."
+        )
+
+        return 2
+
+    if guard.overridden:
+        print(f"WARNING: {guard.reason}")
+
     try:
         pipeline = DownloadPipeline(
             provider,
@@ -475,6 +860,8 @@ def run_download(
             calendar=get_calendar(args.calendar),
             chunk_size=args.chunk_size,
             strict=args.strict,
+            verification=guard.reason,
+            unverified_override=guard.overridden,
         )
 
         result = pipeline.run(
@@ -513,6 +900,12 @@ def main(
 
         if args.command == "validate":
             return run_validate(args)
+
+        if args.command == "provider-check":
+            return run_provider_check(args, provider_factory=provider_factory)
+
+        if args.command == "verify-stage":
+            return run_verify_stage(args, provider_factory=provider_factory)
     except (ProviderError, ValueError) as exc:
         print(f"error: {exc}")
         return 1

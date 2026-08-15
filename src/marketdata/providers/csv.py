@@ -287,6 +287,10 @@ class CsvMarketDataProvider(MarketDataProvider):
 
         return sorted(selected, key=lambda candle: candle.timestamp)
 
+    def configuration(self) -> dict[str, str]:
+        """Describe where the candles are read from."""
+        return {"source": str(self.source)}
+
     def health_check(self) -> bool:
         """Return whether the source exists and can be read."""
         try:

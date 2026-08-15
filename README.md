@@ -80,6 +80,13 @@ src/marketdata/
 │   ├── chunks.py         Chunk planning
 │   ├── checkpoint.py     Resume state
 │   └── pipeline.py       Orchestration
+├── verification/
+│   ├── status.py         PASS / WARN / FAIL / BLOCKED and thresholds
+│   ├── stages.py         smoke, daily, monthly, historical
+│   ├── preflight.py      Can this provider supply usable data at all?
+│   ├── records.py        Durable evidence that a stage passed
+│   ├── guard.py          Refusing a large download without evidence
+│   └── runner.py         Running a stage through the real pipeline
 └── cli.py                Command-line entry point
 ```
 
@@ -330,7 +337,9 @@ uv sync
 
 ## CLI usage
 
-Two commands: `download` acquires data, `validate` checks what was acquired.
+Four commands: `provider-check` asks whether a provider can supply usable
+data, `verify-stage` proves it on a small range, `download` acquires, and
+`validate` checks what was acquired.
 
 ### download
 
@@ -420,6 +429,138 @@ structural defect.
 A structural defect outranks incompleteness: a gap may be the provider's
 fault, but a duplicate row or a mismatched schema is ours.
 
+## Staged acquisition
+
+Years of one-minute data is the last thing to attempt, not the first. The
+staged workflow proves the provider on an hour, then a day, then a month,
+and only then permits a historical acquisition — each stage running through
+the **same** production pipeline, and each judged by re-reading what it
+actually stored.
+
+```text
+provider-check      can this provider supply usable data at all?
+      ↓
+verify-stage smoke      1 hour
+      ↓
+verify-stage daily      1 trading day
+      ↓
+verify-stage monthly    1 calendar month
+      ↓
+download                arbitrary ranges, now permitted
+```
+
+### provider-check
+
+Asks a provider everything that must hold before trusting it with a range:
+that it can be reached, that it accepts the symbol and the timeframe, that
+candles come back, that they parse into canonical `Candle` objects, that
+timestamps are UTC and ordered and inside the window, that OHLC invariants
+hold, and that **pagination stitches**: the same range asked for in two
+halves must equal the whole, with nothing lost or repeated at the boundary.
+
+```bash
+uv run marketdata provider-check --provider dukascopy --symbol EUR/USD --timeframe 1min
+```
+
+Each check reports `PASS`, `WARN`, `FAIL` or `BLOCKED`.
+
+### verify-stage
+
+Acquires one stage's window through `DownloadPipeline` — chunking, rate
+limiting, retries, checkpoints, merging, manifest and quality report all
+included — then re-inspects the result from disk with the dataset
+validator, and writes a verification record.
+
+```bash
+uv run marketdata verify-stage --stage smoke --symbol EUR/USD --start 2026-08-10T00:00:00Z
+```
+
+The stage decides its own end: smoke is an hour, daily a day, monthly a
+calendar month. Only `historical` takes an explicit `--end`.
+
+Verification is never "the command exited 0". A stage passes only if the
+stored dataset reads back, its schema is consistent, its manifest agrees
+with it, its timestamps and OHLC are valid, nothing falls outside the
+range, nothing is duplicated, and the calendar-aware shortfall is within
+threshold.
+
+### What each status means
+
+| Status | Meaning |
+| --- | --- |
+| `PASS` | the stage proved what it set out to prove |
+| `WARN` | proven, with a tolerated shortfall of candles |
+| `FAIL` | data was obtained and something is wrong with it |
+| `BLOCKED` | the provider could not be reached, so **nothing was proven** |
+
+`BLOCKED` is deliberately not `FAIL`. A network policy denial says nothing
+about whether the provider or this code is correct, and recording it as a
+failure would be both a false accusation and a way to lose track of work
+that is simply not done yet.
+
+### Quality thresholds
+
+**Structural defects have no tolerance.** Invalid OHLC, duplicate
+timestamps, out-of-range rows, an unreadable file, a mismatched schema or a
+manifest that disagrees with its data all indicate a bug here or a corrupt
+file, not a property of the market. Any occurrence fails.
+
+**Missing candles are tolerated within a ratio** (`--missing-warn-ratio`,
+`--missing-fail-ratio`; default warn above 0%, fail above 1%). A minute
+with no tick produces no candle, and spot FX genuinely has such minutes.
+
+> The 1% default is a **starting policy, not an empirical finding**. No real
+> Dukascopy data has ever been observed by this project, so the tolerable
+> gap rate is unknown. It is set conservatively — wide enough for ordinary
+> thin-liquidity minutes, narrow enough that a systematically broken
+> download cannot pass — and should be recalibrated from the first real
+> monthly acquisition, recording the reasoning.
+
+### Verification records
+
+Each stage writes a durable record:
+
+```text
+data/verification/dukascopy/EUR_USD/1min/smoke.json
+```
+
+It holds what was tested, when, against which provider and configuration,
+over which range, which dataset and manifest resulted, and the quality and
+validation verdicts. A record is **evidence only about the setup it was made
+against**: it carries a fingerprint of the provider's configuration, so
+pointing at a different endpoint or a different CSV source invalidates it
+rather than being silently reused. A record from an older schema version, an
+unreadable one, or one that did not pass is likewise never counted.
+
+### The safety guard
+
+A download longer than a calendar month is a historical acquisition and is
+**refused** unless smoke, daily and monthly have all been verified for that
+provider, symbol, timeframe and configuration:
+
+```text
+refused: refusing a historical acquisition: smoke, daily, monthly not
+verified for this provider and configuration
+```
+
+Shorter downloads are unguarded — they are the stages themselves, and
+refusing them would leave no way to produce the evidence.
+
+`--force-unverified` overrides the refusal. It is never implicit: it must be
+asked for, it prints a warning, and it is written into the dataset's
+provenance as `unverified_override: true`, so data acquired without evidence
+carries that fact permanently.
+
+### Provenance
+
+Every manifest records how its data came to exist: provider and
+configuration, symbol, timeframe, requested and actual ranges, rows, quality
+status, calendar, chunk size, rate limit, retry policy, acquisition time,
+application version, and the verification the run relied on.
+
+Credentials are never stored. A provider reports that a key is `set` or
+`unset`, never its value.
+
 ## Data layout
 
 Candles are partitioned by symbol, timeframe, year and month:
@@ -429,6 +570,7 @@ data/processed/EUR_USD/timeframe=1min/year=2026/month=08/candles.parquet
 data/manifests/EUR_USD/1min_20260814T120000Z_20260814T130000Z.json
 data/quality/EUR_USD/1min_20260814T120000Z_20260814T130000Z.json
 data/checkpoints/EUR_USD/1min_20260814T120000Z_20260814T130000Z.json
+data/verification/csv/EUR_USD/1min/smoke.json
 ```
 
 Everything below `data/` is generated and git-ignored.
@@ -588,7 +730,8 @@ For every stored dataset:
 See [`planner.md`](planner.md) for the full phase breakdown, per-phase
 acceptance criteria, current blockers and the next milestone. In short: the
 ingestion path through resumable chunked downloads, retries, error
-classification and rate limiting is complete, as is offline dataset
-validation; live provider verification is next and is blocked by the
-development environment's egress policy; dataset acquisition, backtesting,
+classification and rate limiting is complete, as are offline dataset
+validation and the staged acquisition workflow that gates a large download
+on verified smaller ones; live provider verification is next and is blocked
+by the development environment's egress policy; dataset acquisition, backtesting,
 analytics and the UI are planned and not started.
