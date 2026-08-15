@@ -18,9 +18,27 @@ class DatasetManifest(BaseModel):
     dataset_version: str = "1.0.0"
     created_at: datetime
     files: list[str]
+    """Partition files, relative to the dataset root when possible.
+
+    A manifest outlives the working directory it was written from and travels
+    with the dataset it describes, so an absolute or CWD-relative path would
+    stop resolving as soon as either moved.
+    """
+
     quality_report: str | None = None
     quality_status: str | None = None
     checkpoint: str | None = None
+
+
+def _relative_to(path: Path, root: str | Path | None) -> str:
+    """Express a partition path relative to the dataset root when possible."""
+    if root is None:
+        return str(path)
+
+    try:
+        return path.relative_to(Path(root)).as_posix()
+    except ValueError:
+        return str(path)
 
 
 def create_manifest(
@@ -32,6 +50,7 @@ def create_manifest(
     end: datetime,
     provider: str,
     files: list[Path],
+    root: str | Path | None = None,
     actual_start: datetime | None = None,
     actual_end: datetime | None = None,
     quality_report: str | Path | None = None,
@@ -48,7 +67,7 @@ def create_manifest(
         row_count=candles_count,
         provider=provider,
         created_at=datetime.now(UTC),
-        files=[str(path) for path in files],
+        files=[_relative_to(path, root) for path in files],
         quality_report=str(quality_report) if quality_report is not None else None,
         quality_status=quality_status,
         checkpoint=str(checkpoint) if checkpoint is not None else None,

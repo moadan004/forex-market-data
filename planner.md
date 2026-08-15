@@ -20,6 +20,16 @@ implemented, what is next, and why.
 Nothing is marked ✅ because a document says so. Every ✅ below was checked
 against `src/` and `tests/` on the current branch.
 
+Verification is tracked separately from implementation, because the two
+diverge here:
+
+| Term | Meaning |
+| --- | --- |
+| Implemented and tested | code exists and is covered by the suite |
+| Tested with mocks | provider behaviour exercised through a mock HTTP transport, never against Dukascopy |
+| Verified against real Dukascopy | a real response was received and checked — **nothing carries this yet** |
+| Blocked by environment | cannot be attempted from here; the egress policy denies the host |
+
 ## Status at a glance
 
 | Phase | Title | Status |
@@ -37,7 +47,7 @@ against `src/` and `tests/` on the current branch.
 | 11 | API and UI | ⬜ |
 | 12 | Production | ⬜ |
 
-Test suite: **301 passing**. Ruff format and check: clean.
+Test suite: **343 passing**. Ruff format and check: clean.
 
 ---
 
@@ -130,6 +140,7 @@ honest about market closures.
 | Chunk planner | ✅ | `downloader/chunks.py` |
 | Checkpoint / resume | ✅ | `downloader/checkpoint.py` |
 | Partition merging | ✅ | `storage/parquet.py` |
+| Manifest consistency after resume | ✅ | `downloader/pipeline.py`; manifests list the files covering their range, not just what a run wrote |
 | Retry / backoff | ✅ | `providers/retry.py`, wired into the Dukascopy request layer |
 | Provider error classification | ✅ | `providers/errors.py` |
 | Rate limiting | ✅ | `providers/rate_limit.py`, applied to every request including retries |
@@ -198,30 +209,48 @@ next is attempted. No stage may be skipped.
 
 ## Phase 6 — Data-quality verification
 
-**Goal.** Prove the acquired dataset is trustworthy. The *mechanisms* below
-largely exist and are unit-tested; what remains is running them against a
-real acquired dataset, which Phase 5 gates.
+**Goal.** Prove the acquired dataset is trustworthy — on its own evidence,
+not on the word of the run that produced it.
 
-| Check | Mechanism | Verified on real data |
-| --- | --- | --- |
-| Coverage | ✅ `expected_rows` vs `retained_rows` | 🔴 |
-| Missing intervals | ✅ `quality/gaps.py` | 🔴 |
-| Duplicate candles | ✅ dedup + merge by symbol + timestamp | 🔴 |
-| Invalid OHLC | ✅ `validation/candles.py` | 🔴 |
-| Weekend / market closures | ✅ `calendar/forex.py` | 🔴 |
-| Timezone correctness | ✅ UTC enforced at model, pipeline and storage | 🔴 |
-| Partition integrity | ✅ fixed Arrow schema, atomic writes | 🔴 |
-| Read-back validation | ✅ `ParquetStorage.read_table` / `read_candles` | 🔴 |
-| Cross-provider validation | ⬜ only one provider exists | ⬜ |
+The checks and the tool that applies them are implemented and tested. What
+remains is running them against a real acquired dataset, which Phase 5 gates.
+
+| Check | Mechanism | Applied offline | Verified on real data |
+| --- | --- | --- | --- |
+| Coverage | `expected_candles` vs stored | ✅ | 🔴 |
+| Missing intervals | `quality/gaps.py` | ✅ | 🔴 |
+| Duplicate candles | dedup, merge, and a read-back count | ✅ | 🔴 |
+| Invalid OHLC | `validation/candles.py` | ✅ | 🔴 |
+| Timestamp ordering | read-back ordering check | ✅ | 🔴 |
+| Weekend / market closures | `calendar/forex.py` | ✅ | 🔴 |
+| Out-of-range observations | `restrict_to_range` on stored rows | ✅ | 🔴 |
+| Timezone correctness | UTC enforced at model, pipeline and storage | ✅ | 🔴 |
+| Partition integrity | fixed Arrow schema, atomic writes | ✅ | 🔴 |
+| Schema consistency across partitions | per-file schema comparison | ✅ | 🔴 |
+| Partition / file coverage | `ParquetStorage.partition_files` | ✅ | 🔴 |
+| Manifest agreement | claimed rows and files vs stored | ✅ | 🔴 |
+| Read-back validation | `ParquetStorage.read_table` / `read_candles` | ✅ | 🔴 |
+| Quality status classification | `quality/dataset.py` | ✅ | 🔴 |
+| Cross-provider validation | ⬜ only one provider exists | ⬜ | ⬜ |
+
+**Dataset validation tool** — ✅ implemented and tested. `marketdata validate`
+and `validate_dataset()` inspect a stored dataset without contacting a
+provider, reporting every row above plus the gaps, closures and problems
+found. It survives damaged datasets: an unreadable or incompatible partition
+is a finding, not a crash. Exit code `1` on anything but `ok`, so it can gate
+a pipeline.
 
 **Acceptance criteria**
 
-- Every reported missing interval is explained: a genuine provider gap, a
-  market closure, or a holiday.
-- Zero duplicate timestamps per symbol and timeframe.
-- Zero invalid OHLC rows in stored data.
-- The dataset reads back as one logical PyArrow dataset per symbol.
-- A second provider agrees with Dukascopy on a sampled range, within a
+- ✅ A stored dataset can be validated offline, by anyone holding the files.
+- ✅ Zero duplicate timestamps per symbol and timeframe, checked on read-back.
+- ✅ Zero invalid OHLC rows in stored data, checked on read-back.
+- ✅ The dataset reads back as one logical PyArrow dataset per symbol, and a
+  partition whose schema would break that is named.
+- ✅ A manifest that no longer matches what is stored is reported.
+- 🔴 Every reported missing interval on a real dataset is explained: a genuine
+  provider gap, a market closure, or a holiday. Needs real data.
+- ⬜ A second provider agrees with Dukascopy on a sampled range, within a
   documented tolerance.
 
 ---

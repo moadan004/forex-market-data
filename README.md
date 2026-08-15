@@ -70,7 +70,8 @@ src/marketdata/
 │   └── candles.py        OHLC invariants, dedup, merge, range restriction
 ├── quality/
 │   ├── gaps.py           Missing-interval detection
-│   └── report.py         Quality report model
+│   ├── report.py         Quality report model
+│   └── dataset.py        Offline validation of a stored dataset
 ├── storage/
 │   ├── parquet.py        Partitioned Parquet merge, write and read
 │   └── manifest.py       Dataset manifest
@@ -252,6 +253,10 @@ uv sync
 
 ## CLI usage
 
+Two commands: `download` acquires data, `validate` checks what was acquired.
+
+### download
+
 ```bash
 uv run marketdata download \
   --symbol EUR/USD \
@@ -286,6 +291,56 @@ path of every artifact it wrote. It exits `1` when a chunk failed,
 listing each failure, and rerunning the same command retries only those
 chunks.
 
+### validate
+
+Check an already-downloaded dataset. This reads Parquet from disk and
+contacts no provider, so a dataset can be re-checked at any time by anyone
+holding the files — including in CI, and including datasets acquired by
+someone else.
+
+```bash
+uv run marketdata validate --symbol EUR/USD
+```
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--symbol` | required | Symbol to inspect |
+| `--timeframe` | `1min` | Timeframe to inspect |
+| `--start` / `--end` | from manifests | Window to judge the dataset against |
+| `--calendar` | `forex` | Calendar separating expected candles from closures |
+| `--data-root` | `data/processed` | Parquet root |
+| `--manifest-root` | `data/manifests` | Manifest root |
+| `--no-manifests` | off | Judge the data on its own extent, ignoring manifests |
+| `--allow-incomplete` | off | Exit 0 when the only finding is missing candles |
+| `--json` | off | Print the report as JSON |
+
+It reports the symbol, timeframe, checked and actual ranges, candles stored
+against candles expected, missing candles and the gaps that make them up,
+market closures, duplicates, invalid OHLC rows, out-of-range rows,
+out-of-order rows, the Parquet files making up the dataset, whether their
+schemas agree, and whether each manifest still matches what is stored.
+
+**Which window is it judged against?** An explicit `--start`/`--end` wins.
+Otherwise the manifests say what was meant to be acquired, which is the
+honest yardstick for completeness. With neither, the data is judged against
+its own extent — which by construction can never report a missing candle at
+the edges.
+
+**Exit codes.** `0` when the dataset is `ok`; `1` otherwise, so the command
+can gate a pipeline. `--allow-incomplete` downgrades missing candles alone to
+success, for datasets with known provider or holiday gaps; it never hides a
+structural defect.
+
+| Status | Meaning |
+| --- | --- |
+| `invalid` | a structural defect: duplicates, invalid OHLC, out-of-range or out-of-order rows, a schema mismatch, an unreadable file, or a manifest that disagrees |
+| `empty` | nothing is stored |
+| `incomplete` | expected trading time is not fully covered |
+| `ok` | none of the above |
+
+A structural defect outranks incompleteness: a gap may be the provider's
+fault, but a duplicate row or a mismatched schema is ours.
+
 ## Data layout
 
 Candles are partitioned by symbol, timeframe, year and month:
@@ -298,6 +353,11 @@ data/checkpoints/EUR_USD/1min_20260814T120000Z_20260814T130000Z.json
 ```
 
 Everything below `data/` is generated and git-ignored.
+
+A manifest records its partition files relative to the dataset root, so it
+keeps resolving after the dataset is copied or moved, and it describes the
+files covering its whole range — including on a resumed run that downloaded
+nothing itself.
 
 Files use a fixed Arrow schema so partitions from different months stay
 mutually readable: `timestamp` as `timestamp[us, tz=UTC]`, `symbol` as
@@ -416,6 +476,9 @@ For every stored dataset:
 - **Interrupted runs do not corrupt stored data.** Partitions and checkpoints
   are written to a temporary file and renamed into place, and a failing chunk
   never rewrites another chunk's partition.
+- **Every guarantee is re-checkable offline.** `marketdata validate` re-applies
+  each of the checks above to the stored files, so a dataset is trusted on its
+  own evidence rather than on the word of the run that produced it.
 
 ### Known limitations
 
@@ -446,6 +509,7 @@ For every stored dataset:
 See [`planner.md`](planner.md) for the full phase breakdown, per-phase
 acceptance criteria, current blockers and the next milestone. In short: the
 ingestion path through resumable chunked downloads, retries, error
-classification and rate limiting is complete; live provider verification is
-next and is blocked by the development environment's egress policy; dataset acquisition, backtesting,
+classification and rate limiting is complete, as is offline dataset
+validation; live provider verification is next and is blocked by the
+development environment's egress policy; dataset acquisition, backtesting,
 analytics and the UI are planned and not started.

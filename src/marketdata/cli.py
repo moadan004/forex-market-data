@@ -17,8 +17,12 @@ from marketdata.providers.retry import (
     DEFAULT_MAX_BACKOFF_SECONDS,
     RetryPolicy,
 )
+from marketdata.quality.dataset import DatasetValidationReport, validate_dataset
+from marketdata.quality.report import QualityStatus
 
 ProviderFactory = Callable[[], MarketDataProvider]
+
+MAX_LISTED_GAPS = 10
 
 
 def parse_datetime(value: str) -> datetime:
@@ -182,6 +186,75 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the quality report as JSON instead of a text summary.",
     )
 
+    validate = subparsers.add_parser(
+        "validate",
+        help="Check an already-downloaded dataset without contacting a provider.",
+    )
+
+    validate.add_argument(
+        "--symbol",
+        required=True,
+        help="Symbol to inspect, for example EUR/USD.",
+    )
+    validate.add_argument(
+        "--timeframe",
+        default="1min",
+        help="Timeframe to inspect. Default: 1min.",
+    )
+    validate.add_argument(
+        "--start",
+        type=parse_datetime,
+        help=(
+            "UTC start of the window to judge the dataset against. "
+            "Defaults to the range its manifests claim."
+        ),
+    )
+    validate.add_argument(
+        "--end",
+        type=parse_datetime,
+        help="UTC end of the window to judge the dataset against (exclusive).",
+    )
+    validate.add_argument(
+        "--calendar",
+        default="forex",
+        choices=sorted(CALENDARS),
+        help=(
+            "Trading calendar used to tell an expected candle from a market "
+            "closure. Default: forex."
+        ),
+    )
+    validate.add_argument(
+        "--data-root",
+        default="data/processed",
+        dest="data_root",
+        help="Root directory holding the Parquet dataset. Default: data/processed.",
+    )
+    validate.add_argument(
+        "--manifest-root",
+        default="data/manifests",
+        help="Root directory holding manifests. Default: data/manifests.",
+    )
+    validate.add_argument(
+        "--no-manifests",
+        action="store_false",
+        dest="use_manifests",
+        help="Judge the dataset on its own extent, ignoring any manifests.",
+    )
+    validate.add_argument(
+        "--allow-incomplete",
+        action="store_true",
+        help=(
+            "Exit 0 when the only finding is missing candles, for datasets "
+            "with known provider or holiday gaps."
+        ),
+    )
+    validate.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Print the validation report as JSON instead of a text summary.",
+    )
+
     return parser
 
 
@@ -242,6 +315,95 @@ def format_summary(result: DownloadResult) -> str:
         lines.append("Rerun the same command to retry the failed chunks.")
 
     return "\n".join(lines)
+
+
+def format_validation(report: DatasetValidationReport) -> str:
+    """Render a human-readable summary of one dataset validation."""
+    lines = [
+        f"Symbol:            {report.symbol}",
+        f"Timeframe:         {report.timeframe}",
+        f"Calendar:          {report.calendar}",
+        (
+            f"Checked range:     {_format_timestamp(report.range_start)}"
+            f" -> {_format_timestamp(report.range_end)}"
+            f" (from {report.range_source})"
+        ),
+        (
+            f"Actual range:      {_format_timestamp(report.actual_start)}"
+            f" -> {_format_timestamp(report.actual_end)}"
+        ),
+        f"Candles:           {report.candles}",
+    ]
+
+    if report.expected_candles is not None:
+        lines.append(f"Expected candles:  {report.expected_candles}")
+
+    lines.extend(
+        [
+            f"Missing candles:   {report.missing_candles}",
+            f"Detected gaps:     {len(report.missing_intervals)}",
+            f"Market closures:   {len(report.market_closed_intervals)}",
+            f"Duplicate candles: {report.duplicate_candles}",
+            f"Invalid OHLC rows: {report.invalid_rows}",
+            f"Out of range rows: {report.out_of_range_rows}",
+            f"Unordered rows:    {report.unordered_rows}",
+            f"Parquet files:     {report.files}",
+            f"Schema consistent: {'yes' if report.schema_consistent else 'no'}",
+            f"Manifests:         {len(report.manifests)}",
+        ]
+    )
+
+    for check in report.manifests:
+        verdict = "agrees" if check.agrees else "DISAGREES"
+        lines.append(
+            f"  - {check.path}: {verdict} "
+            f"({check.claimed_rows} claimed, {check.stored_rows} stored)"
+        )
+
+    lines.append(f"Status:            {report.status.value}")
+
+    if report.problems:
+        lines.append("Problems:")
+        lines.extend(f"  - {problem}" for problem in report.problems)
+
+    for interval in report.missing_intervals[:MAX_LISTED_GAPS]:
+        lines.append(
+            f"  gap {interval.start:%Y-%m-%dT%H:%M:%SZ}"
+            f" -> {interval.end:%Y-%m-%dT%H:%M:%SZ}"
+            f" ({interval.missing_candles} candles)"
+        )
+
+    if len(report.missing_intervals) > MAX_LISTED_GAPS:
+        lines.append(
+            f"  ... and {len(report.missing_intervals) - MAX_LISTED_GAPS} more gaps"
+        )
+
+    return "\n".join(lines)
+
+
+def run_validate(args: argparse.Namespace) -> int:
+    report = validate_dataset(
+        symbol=args.symbol,
+        timeframe=args.timeframe,
+        data_root=args.data_root,
+        manifest_root=args.manifest_root if args.use_manifests else None,
+        calendar=get_calendar(args.calendar),
+        start=args.start,
+        end=args.end,
+    )
+
+    if args.as_json:
+        print(report.model_dump_json(indent=2))
+    else:
+        print(format_validation(report))
+
+    if report.ok:
+        return 0
+
+    if args.allow_incomplete and report.status is QualityStatus.INCOMPLETE:
+        return 0
+
+    return 1
 
 
 def rate_limit_from_args(args: argparse.Namespace) -> RateLimit:
@@ -315,15 +477,18 @@ def main(
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command != "download":
-        parser.error("unknown command")
-        return 2
-
     try:
-        return run_download(args, provider_factory=provider_factory)
+        if args.command == "download":
+            return run_download(args, provider_factory=provider_factory)
+
+        if args.command == "validate":
+            return run_validate(args)
     except (ProviderError, ValueError) as exc:
         print(f"error: {exc}")
         return 1
+
+    parser.error(f"unknown command: {args.command}")
+    return 2
 
 
 if __name__ == "__main__":

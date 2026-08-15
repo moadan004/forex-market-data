@@ -77,6 +77,7 @@ class DownloadResult:
     chunks_failed: int
     chunks_skipped: int
     retries: int
+    files_written: list[Path]
     rate_limit: str
     throttled_seconds: float
     failures: list[str]
@@ -309,7 +310,18 @@ class DownloadPipeline:
         # Providers are not required to throttle, so ask rather than assume.
         rate_limit = getattr(self.provider, "rate_limit", None)
         limiter_stats = getattr(self.provider, "rate_limit_stats", None)
-        files = sorted({path for outcome in outcomes for path in outcome.files})
+
+        written = sorted({path for outcome in outcomes for path in outcome.files})
+
+        # The manifest describes the dataset covering the requested range, not
+        # the subset this run happened to write. A resumed run writes nothing
+        # yet still stands behind every file its range depends on.
+        files = self.storage.partition_files(
+            symbol=symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+        )
 
         report = build_quality_report(
             provider=self.provider.name,
@@ -346,6 +358,7 @@ class DownloadPipeline:
             actual_end=report.actual_end,
             provider=self.provider.name,
             files=files,
+            root=self.storage.root,
             quality_report=quality_path,
             quality_status=report.status.value,
             checkpoint=checkpoint_path,
@@ -376,6 +389,7 @@ class DownloadPipeline:
             chunks_failed=report.chunks_failed,
             chunks_skipped=skipped,
             retries=sum(outcome.retries for outcome in outcomes),
+            files_written=written,
             rate_limit=rate_limit.describe() if rate_limit else "none",
             throttled_seconds=(
                 limiter_stats.total_wait_seconds if limiter_stats else 0.0

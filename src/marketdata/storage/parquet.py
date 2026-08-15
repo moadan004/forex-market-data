@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 
@@ -45,6 +45,51 @@ _VOLUME_QUANTUM = Decimal(1).scaleb(-VOLUME_SCALE)
 def normalize_symbol_path(symbol: str) -> str:
     """Return the on-disk directory name for a symbol."""
     return symbol.strip().upper().replace("/", "_")
+
+
+def _partition_month(path: Path) -> tuple[int, int] | None:
+    """Read the year and month out of a hive-partitioned file path."""
+    parts = {
+        piece.split("=", 1)[0]: piece.split("=", 1)[1]
+        for piece in path.parts
+        if "=" in piece
+    }
+
+    try:
+        return int(parts["year"]), int(parts["month"])
+    except (KeyError, ValueError):
+        return None
+
+
+def _partition_overlaps(
+    path: Path,
+    start: datetime | None,
+    end: datetime | None,
+) -> bool:
+    """Return whether a partition file can hold rows inside ``[start, end)``."""
+    if start is None and end is None:
+        return True
+
+    month = _partition_month(path)
+
+    if month is None:
+        # An unrecognized layout is never silently excluded; validation
+        # reports it rather than the reader hiding it.
+        return True
+
+    year, index = month
+    month_start = datetime(year, index, 1, tzinfo=UTC)
+    month_end = datetime(
+        year + (index == 12),
+        1 if index == 12 else index + 1,
+        1,
+        tzinfo=UTC,
+    )
+
+    if end is not None and month_start >= end:
+        return False
+
+    return not (start is not None and month_end <= start)
 
 
 def _quantize(value: Decimal, quantum: Decimal) -> Decimal:
@@ -99,6 +144,46 @@ class ParquetStorage:
             path = path / f"timeframe={timeframe}"
 
         return path
+
+    def partition_files(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> list[Path]:
+        """
+        Return the Parquet files holding a symbol's data, in partition order.
+
+        Restricting by range selects whole partitions: a month is included
+        when any part of it falls inside ``[start, end)``, because that is
+        the granularity the files are written at.
+        """
+        directory = self.dataset_path(symbol, timeframe)
+
+        if not directory.exists():
+            return []
+
+        files = [
+            path
+            for path in sorted(directory.rglob("*.parquet"))
+            if _partition_overlaps(path, start, end)
+        ]
+
+        return files
+
+    def partition_schemas(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None = None,
+    ) -> dict[Path, pa.Schema]:
+        """Return the on-disk schema of every partition file."""
+        return {
+            path: pq.read_schema(path)
+            for path in self.partition_files(symbol=symbol, timeframe=timeframe)
+        }
 
     def write(
         self,

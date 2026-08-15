@@ -162,3 +162,90 @@ def test_write_of_empty_dataset_creates_nothing(tmp_path):
 
     assert storage.write([], symbol="EUR/USD", timeframe="1min") == []
     assert list(tmp_path.iterdir()) == []
+
+
+def test_partition_files_are_listed_in_order(tmp_path):
+    storage = ParquetStorage(tmp_path)
+
+    storage.write(
+        [
+            make_candle(datetime(2026, 9, 1, tzinfo=UTC)),
+            make_candle(datetime(2026, 8, 1, tzinfo=UTC)),
+            make_candle(datetime(2027, 1, 1, tzinfo=UTC)),
+        ],
+        symbol="EUR/USD",
+        timeframe="1min",
+    )
+
+    files = storage.partition_files(symbol="EUR/USD", timeframe="1min")
+
+    assert [path.parent.parent.name + "/" + path.parent.name for path in files] == [
+        "year=2026/month=08",
+        "year=2026/month=09",
+        "year=2027/month=01",
+    ]
+
+
+def test_partition_files_can_be_restricted_to_a_range(tmp_path):
+    storage = ParquetStorage(tmp_path)
+
+    storage.write(
+        [
+            make_candle(datetime(2026, 8, 15, tzinfo=UTC)),
+            make_candle(datetime(2026, 9, 15, tzinfo=UTC)),
+            make_candle(datetime(2026, 10, 15, tzinfo=UTC)),
+        ],
+        symbol="EUR/USD",
+        timeframe="1min",
+    )
+
+    selected = storage.partition_files(
+        symbol="EUR/USD",
+        timeframe="1min",
+        start=datetime(2026, 9, 10, tzinfo=UTC),
+        end=datetime(2026, 9, 20, tzinfo=UTC),
+    )
+
+    assert [path.parent.name for path in selected] == ["month=09"]
+
+
+def test_a_partition_touching_the_range_edge_is_included(tmp_path):
+    """Selection is by whole month, because that is the write granularity."""
+    storage = ParquetStorage(tmp_path)
+
+    storage.write(
+        [
+            make_candle(datetime(2026, 8, 31, 23, 59, tzinfo=UTC)),
+            make_candle(datetime(2026, 9, 1, 0, 0, tzinfo=UTC)),
+        ],
+        symbol="EUR/USD",
+        timeframe="1min",
+    )
+
+    selected = storage.partition_files(
+        symbol="EUR/USD",
+        timeframe="1min",
+        start=datetime(2026, 8, 31, 23, 0, tzinfo=UTC),
+        end=datetime(2026, 9, 1, 1, 0, tzinfo=UTC),
+    )
+
+    assert len(selected) == 2
+
+
+def test_partition_files_of_an_unknown_symbol_is_empty(tmp_path):
+    assert ParquetStorage(tmp_path).partition_files(symbol="GBP/USD") == []
+
+
+def test_partition_schemas_are_reported_per_file(tmp_path):
+    storage = ParquetStorage(tmp_path)
+
+    storage.write(
+        [make_candle(datetime(2026, 8, 14, 12, 0, tzinfo=UTC))],
+        symbol="EUR/USD",
+        timeframe="1min",
+    )
+
+    schemas = storage.partition_schemas(symbol="EUR/USD", timeframe="1min")
+
+    assert len(schemas) == 1
+    assert next(iter(schemas.values())).equals(CANDLE_SCHEMA)
