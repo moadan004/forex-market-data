@@ -86,7 +86,9 @@ src/marketdata/
 │   ├── preflight.py      Can this provider supply usable data at all?
 │   ├── records.py        Durable evidence that a stage passed
 │   ├── guard.py          Refusing a large download without evidence
-│   └── runner.py         Running a stage through the real pipeline
+│   ├── runner.py         Running a stage through the real pipeline
+│   ├── comparison.py     Comparing two stored datasets, month by month
+│   └── comparison_records.py  Durable, self-expiring comparison evidence
 └── cli.py                Command-line entry point
 ```
 
@@ -429,6 +431,125 @@ structural defect.
 A structural defect outranks incompleteness: a gap may be the provider's
 fault, but a duplicate row or a mismatched schema is ours.
 
+### compare
+
+Compare two **stored datasets** against each other. Like `validate`, this
+reads Parquet from disk and contacts no provider — but where `validate` judges
+one dataset on its own terms, `compare` judges two against each other.
+
+It is not coupled to any particular provider. Both sides are just datasets, so
+the same command compares a Dukascopy dataset with a CSV one, two CSV feeds,
+or the same acquisition run twice.
+
+```bash
+uv run marketdata compare \
+  --left  data/dukascopy/processed \
+  --right data/csv/processed \
+  --symbol EUR/USD --timeframe 1min
+```
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--left` / `--right` | required | Parquet roots of the two datasets |
+| `--symbol` | required | Symbol to compare |
+| `--timeframe` | `1min` | Timeframe to compare |
+| `--start` / `--end` | everything stored | UTC window to compare within |
+| `--left-manifest-root` / `--right-manifest-root` | none | Manifests identifying which provider produced each side |
+| `--price-tolerance` | `0.0001` | Relative difference two prices may show and still agree |
+| `--volume-tolerance` | `0.05` | Relative difference two volumes may show and still agree |
+| `--price-mismatch-warn-ratio` / `--price-mismatch-fail-ratio` | `0.0` / `0.001` | Fraction of compared candles that may disagree on price |
+| `--volume-mismatch-warn-ratio` / `--volume-mismatch-fail-ratio` | `0.0` / `1.0` | Fraction that may disagree on volume |
+| `--missing-warn-ratio` / `--missing-fail-ratio` | `0.0` / `0.01` | Fraction present on only one side |
+| `--record-root` | none | Write a durable comparison record |
+| `--json` | off | Print the report as JSON |
+
+It reports both datasets and the providers behind them, the requested range
+and the actual range each side covers, candles compared, matching and
+mismatching counts, price and volume mismatches separately, candles present on
+only one side in each direction, duplicate timestamps, the largest observed
+price and volume difference with the timestamp it occurred at, gaps unique to
+either side, the thresholds applied, and the verdict.
+
+```text
+Symbol:            EUR/USD
+Left provider:     csv (d992ad20a9835c61)
+Right provider:    csv (2514ce47769f8950)
+Left range:        2026-08-10T00:00:00Z -> 2026-08-10T01:59:00Z
+Right range:       2026-08-10T00:00:00Z -> 2026-08-10T01:59:00Z
+Candles compared:  119
+Matching:          119
+Mismatching:       0
+Missing in left:   0
+Missing in right:  1
+Max price diff:    0.00002000 at 2026-08-10T00:00:00Z (0.00001710 relative)
+Gaps on one side:  0 left only, 1 right only
+Problems:
+  - right is missing 1 candle that left holds
+Verdict:           WARN
+```
+
+**Exit codes.** `0` on `pass` or `warn`; `1` on `fail` or `blocked`.
+
+**Tolerances are relative and decimal.** Prices and volumes are never
+compared for exact equality, and never as floats: a tolerance is a `Decimal`
+proportion, so the same setting means the same thing for a 1.08 euro rate and
+a 157 yen one. The defaults and the reasoning behind each are documented on
+`ComparisonThresholds` and in [`planner.md`](planner.md); in short, one pip on
+EUR/USD for prices, and volume differences are reported but never fail because
+FX has no consolidated tape and "volume" is one provider's own tick count.
+
+**It is read-only.** The comparison never writes to either dataset, never
+reconciles a disagreement, and never prefers one side. A difference is
+counted and located, and what to do about it is a human decision.
+
+**It is bounded in memory.** Both datasets are read a month at a time, so
+comparing years of one-minute data holds one month of each side rather than
+the whole history. A gap spanning a partition boundary is still found.
+
+**Damage is a finding, not a crash.** A corrupt partition, a missing file or
+an incompatible schema is reported by path and fails the comparison; no raw
+PyArrow error escapes.
+
+**BLOCKED is not agreement.** Two empty datasets, or a range covering nothing
+stored, produce `BLOCKED` rather than `PASS`: comparing nothing against
+nothing proves nothing.
+
+#### Comparison records
+
+`--record-root` writes a durable record holding both provider identities and
+configurations, both dataset fingerprints, the symbol, timeframe, range,
+thresholds and the whole report:
+
+```bash
+uv run marketdata compare --left ... --right ... --symbol EUR/USD \
+  --record-root data/verification/comparisons
+```
+
+The record expires by itself. Changing either dataset by a single byte,
+either provider configuration, the symbol, the timeframe, the range, the
+thresholds, or the record schema version all invalidate it, because every one
+of those is folded into the fingerprint the record carries. Unlike a stage
+verification record, a stored `fail` is still returned — that finding is
+exactly what a later reader needs to see.
+
+No credential is ever written. Provider configuration travels as the provider
+describes itself, which reports an API key as `set` or `unset`, never by value.
+
+#### Offline comparison is not live verification
+
+Three different things, deliberately not conflated:
+
+| Kind of verification | What it proves | Status |
+| --- | --- | --- |
+| Offline cross-provider comparison | two stored datasets agree, or exactly how they differ | implemented and tested |
+| Mocked provider testing | our client handles the responses we *assume* Dukascopy gives | done, via a mock transport |
+| Real Dukascopy verification | a real Dukascopy response was received and checked | **never achieved** |
+
+Running `compare` between a CSV dataset and a Dukascopy dataset would be a
+real cross-provider verification. It has never been run, because no Dukascopy
+dataset exists: the egress policy blocks the endpoint. The tool is finished;
+one side of the comparison is not.
+
 ## Staged acquisition
 
 Years of one-minute data is the last thing to attempt, not the first. The
@@ -668,8 +789,9 @@ The suite covers the model, the provider contract, the Dukascopy provider
 against a mock HTTP transport (including backwards pagination), UTC
 normalization, OHLC validation, deduplication, the session calendar, chunk
 planning, checkpoint and resume behaviour, partition merging, gap detection,
-the quality report, Parquet round-tripping, and the CLI end to end for fresh,
-failed and resumed runs.
+the quality report, Parquet round-tripping, cross-provider comparison over two
+independent CSV feeds acquired through the real pipeline, and the CLI end to
+end for fresh, failed and resumed runs.
 
 ## Data-quality guarantees
 
@@ -724,6 +846,19 @@ For every stored dataset:
   share a limiter, so running several at once multiplies the request rate.
 - Pacing is uniform: there is no adaptive slowdown that lowers the rate after
   a provider signals overload beyond honouring `Retry-After` on that request.
+- **Cross-provider comparison has never been run against Dukascopy.** The tool
+  is complete and tested offline, but one side of the comparison — a real
+  Dukascopy dataset — does not exist.
+- `compare` matches gaps by exact interval equality, so two partially
+  overlapping gaps are reported as unique to each side rather than as one
+  shared gap of different length. The missing-candle counts that drive the
+  verdict are exact either way.
+- Comparison fingerprints hash every partition's bytes. That is deliberate — a
+  fingerprint that can miss a change is not evidence — but fingerprinting a
+  multi-year dataset is I/O bound.
+- `compare` assumes both datasets use this project's month-partitioned layout.
+- A dataset's provider identity comes from the manifests beside it. Without a
+  manifest root, both sides are compared as provider `unknown`.
 
 ## Roadmap
 
@@ -731,7 +866,8 @@ See [`planner.md`](planner.md) for the full phase breakdown, per-phase
 acceptance criteria, current blockers and the next milestone. In short: the
 ingestion path through resumable chunked downloads, retries, error
 classification and rate limiting is complete, as are offline dataset
-validation and the staged acquisition workflow that gates a large download
-on verified smaller ones; live provider verification is next and is blocked
+validation, the staged acquisition workflow that gates a large download on
+verified smaller ones, and offline cross-provider comparison of two stored
+datasets; live provider verification is next and is blocked
 by the development environment's egress policy; dataset acquisition, backtesting,
 analytics and the UI are planned and not started.

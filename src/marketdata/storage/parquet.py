@@ -250,6 +250,16 @@ class ParquetStorage:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def read_partition(self, path: str | Path) -> list[Candle]:
+        """
+        Read a single partition file.
+
+        Comparing or scanning a multi-year dataset one partition at a time
+        keeps the working set to a month of candles rather than the whole
+        history.
+        """
+        return table_to_candles(pq.read_table(Path(path)))
+
     def read_table(
         self,
         *,

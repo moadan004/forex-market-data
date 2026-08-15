@@ -4,6 +4,7 @@ import argparse
 import json
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 
 from marketdata.calendar import CALENDARS, get_calendar
 from marketdata.downloader.chunks import ChunkSize, parse_chunk_size
@@ -21,6 +22,21 @@ from marketdata.providers.retry import (
 )
 from marketdata.quality.dataset import DatasetValidationReport, validate_dataset
 from marketdata.quality.report import QualityStatus
+from marketdata.verification.comparison import (
+    DEFAULT_PRICE_MISMATCH_FAIL_RATIO,
+    DEFAULT_PRICE_MISMATCH_WARN_RATIO,
+    DEFAULT_PRICE_TOLERANCE,
+    DEFAULT_VOLUME_MISMATCH_FAIL_RATIO,
+    DEFAULT_VOLUME_MISMATCH_WARN_RATIO,
+    DEFAULT_VOLUME_TOLERANCE,
+    ComparisonReport,
+    ComparisonThresholds,
+    compare_datasets,
+)
+from marketdata.verification.comparison_records import (
+    ComparisonStore,
+    build_comparison_record,
+)
 from marketdata.verification.guard import check_download
 from marketdata.verification.preflight import PreflightReport, check_provider
 from marketdata.verification.records import VerificationStore
@@ -53,6 +69,25 @@ def parse_datetime(value: str) -> datetime:
         raise argparse.ArgumentTypeError("datetime must include timezone information")
 
     return result.astimezone(UTC)
+
+
+def tolerance(value: str) -> Decimal:
+    """
+    Parse a relative tolerance as a Decimal.
+
+    Deliberately not a float: tolerances are compared against decimal prices,
+    and a binary approximation of 0.0001 would make the bound depend on the
+    magnitude of the price it is applied to.
+    """
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as exc:
+        raise argparse.ArgumentTypeError(f"invalid decimal tolerance: {value}") from exc
+
+    if parsed < 0 or not parsed.is_finite():
+        raise argparse.ArgumentTypeError("tolerance must be a finite, positive decimal")
+
+    return parsed
 
 
 def chunk_size(value: str) -> ChunkSize:
@@ -310,6 +345,149 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="as_json",
         help="Print the validation report as JSON instead of a text summary.",
+    )
+
+    compare = subparsers.add_parser(
+        "compare",
+        help="Compare two stored datasets against each other, offline.",
+        description=(
+            "Compare two already-stored datasets covering the same symbol and "
+            "timeframe. Reads both, writes to neither, and never decides that "
+            "one provider is right: disagreements are reported, not resolved."
+        ),
+    )
+
+    compare.add_argument(
+        "--left",
+        required=True,
+        help="Root directory of the first Parquet dataset.",
+    )
+    compare.add_argument(
+        "--right",
+        required=True,
+        help="Root directory of the second Parquet dataset.",
+    )
+    compare.add_argument(
+        "--symbol",
+        required=True,
+        help="Symbol to compare, for example EUR/USD.",
+    )
+    compare.add_argument(
+        "--timeframe",
+        default="1min",
+        help="Timeframe to compare. Default: 1min.",
+    )
+    compare.add_argument(
+        "--start",
+        type=parse_datetime,
+        help="UTC start of the window to compare. Defaults to everything stored.",
+    )
+    compare.add_argument(
+        "--end",
+        type=parse_datetime,
+        help="UTC end of the window to compare (exclusive).",
+    )
+    compare.add_argument(
+        "--left-manifest-root",
+        help=(
+            "Manifests describing the first dataset, used to identify which "
+            "provider produced it."
+        ),
+    )
+    compare.add_argument(
+        "--right-manifest-root",
+        help="Manifests describing the second dataset.",
+    )
+    compare.add_argument(
+        "--price-tolerance",
+        type=tolerance,
+        default=DEFAULT_PRICE_TOLERANCE,
+        help=(
+            "Relative difference two prices may show and still agree, as a "
+            "decimal fraction. Two feeds quoting the same instrument differ by "
+            f"about a spread. Default: {DEFAULT_PRICE_TOLERANCE} (~1 pip on "
+            "EUR/USD)."
+        ),
+    )
+    compare.add_argument(
+        "--volume-tolerance",
+        type=tolerance,
+        default=DEFAULT_VOLUME_TOLERANCE,
+        help=(
+            "Relative difference two volumes may show and still agree. FX has "
+            "no consolidated tape, so volumes are provider-specific tick "
+            f"counts. Default: {DEFAULT_VOLUME_TOLERANCE}."
+        ),
+    )
+    compare.add_argument(
+        "--price-mismatch-warn-ratio",
+        type=float,
+        default=DEFAULT_PRICE_MISMATCH_WARN_RATIO,
+        help=(
+            "Fraction of compared candles that may disagree on price before "
+            f"warning. Default: {DEFAULT_PRICE_MISMATCH_WARN_RATIO}."
+        ),
+    )
+    compare.add_argument(
+        "--price-mismatch-fail-ratio",
+        type=float,
+        default=DEFAULT_PRICE_MISMATCH_FAIL_RATIO,
+        help=(
+            "Fraction of compared candles that may disagree on price before "
+            f"failing. Default: {DEFAULT_PRICE_MISMATCH_FAIL_RATIO}."
+        ),
+    )
+    compare.add_argument(
+        "--volume-mismatch-warn-ratio",
+        type=float,
+        default=DEFAULT_VOLUME_MISMATCH_WARN_RATIO,
+        help=(
+            "Fraction of compared candles that may disagree on volume before "
+            f"warning. Default: {DEFAULT_VOLUME_MISMATCH_WARN_RATIO}."
+        ),
+    )
+    compare.add_argument(
+        "--volume-mismatch-fail-ratio",
+        type=float,
+        default=DEFAULT_VOLUME_MISMATCH_FAIL_RATIO,
+        help=(
+            "Fraction of compared candles that may disagree on volume before "
+            "failing. The default of "
+            f"{DEFAULT_VOLUME_MISMATCH_FAIL_RATIO} is unreachable, which is "
+            "how 'report volume differences but never fail on them' is said."
+        ),
+    )
+    compare.add_argument(
+        "--missing-warn-ratio",
+        type=float,
+        default=DEFAULT_MISSING_WARN_RATIO,
+        help=(
+            "Fraction of the combined candles that may be present on only one "
+            f"side before warning. Default: {DEFAULT_MISSING_WARN_RATIO}."
+        ),
+    )
+    compare.add_argument(
+        "--missing-fail-ratio",
+        type=float,
+        default=DEFAULT_MISSING_FAIL_RATIO,
+        help=(
+            "Fraction of the combined candles that may be present on only one "
+            f"side before failing. Default: {DEFAULT_MISSING_FAIL_RATIO}."
+        ),
+    )
+    compare.add_argument(
+        "--record-root",
+        help=(
+            "Write a durable comparison record under this directory. The "
+            "record expires by itself when either dataset, either provider "
+            "configuration, the range or the thresholds change."
+        ),
+    )
+    compare.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Print the comparison report as JSON instead of a text summary.",
     )
 
     preflight = subparsers.add_parser(
@@ -593,6 +771,144 @@ def run_validate(args: argparse.Namespace) -> int:
         return 0
 
     return 1
+
+
+def comparison_thresholds_from_args(
+    args: argparse.Namespace,
+) -> ComparisonThresholds:
+    return ComparisonThresholds(
+        price_tolerance=args.price_tolerance,
+        volume_tolerance=args.volume_tolerance,
+        price_mismatch_warn_ratio=args.price_mismatch_warn_ratio,
+        price_mismatch_fail_ratio=args.price_mismatch_fail_ratio,
+        volume_mismatch_warn_ratio=args.volume_mismatch_warn_ratio,
+        volume_mismatch_fail_ratio=args.volume_mismatch_fail_ratio,
+        missing_warn_ratio=args.missing_warn_ratio,
+        missing_fail_ratio=args.missing_fail_ratio,
+    )
+
+
+def format_comparison(report: ComparisonReport) -> str:
+    """Render a human-readable summary of one cross-dataset comparison."""
+    lines = [
+        f"Symbol:            {report.symbol}",
+        f"Timeframe:         {report.timeframe}",
+        f"Left dataset:      {report.left.root}",
+        f"Left provider:     {report.left.provider} ({report.left.dataset_fingerprint})",
+        f"Right dataset:     {report.right.root}",
+        (
+            f"Right provider:    {report.right.provider} "
+            f"({report.right.dataset_fingerprint})"
+        ),
+        (
+            f"Requested range:   {_format_timestamp(report.requested_start)}"
+            f" -> {_format_timestamp(report.requested_end)}"
+        ),
+        (
+            f"Left range:        {_format_timestamp(report.left_start)}"
+            f" -> {_format_timestamp(report.left_end)}"
+        ),
+        (
+            f"Right range:       {_format_timestamp(report.right_start)}"
+            f" -> {_format_timestamp(report.right_end)}"
+        ),
+        f"Ranges match:      {'yes' if report.ranges_match else 'no'}",
+        f"Partitions:        {report.partitions_compared}",
+        f"Candles compared:  {report.candles_compared}",
+        f"Matching:          {report.matching_candles}",
+        f"Mismatching:       {report.mismatching_candles}",
+        f"  price:           {report.price_mismatches}",
+        f"  volume:          {report.volume_mismatches}",
+        f"Missing in left:   {report.missing_from_left}",
+        f"Missing in right:  {report.missing_from_right}",
+        f"Duplicates left:   {report.duplicate_timestamps_left}",
+        f"Duplicates right:  {report.duplicate_timestamps_right}",
+        (
+            f"Max price diff:    {report.max_price_difference}"
+            f" at {_format_timestamp(report.max_price_difference_at)}"
+            f" ({report.max_price_relative_difference:.8f} relative)"
+        ),
+        (
+            f"Max volume diff:   {report.max_volume_difference}"
+            f" at {_format_timestamp(report.max_volume_difference_at)}"
+        ),
+        f"Gaps left/right:   {report.gaps_left}/{report.gaps_right}",
+        (
+            f"Gaps on one side:  {report.gaps_only_left} left only, "
+            f"{report.gaps_only_right} right only"
+        ),
+        f"Thresholds:        {report.thresholds_description}",
+    ]
+
+    if not report.volume_available:
+        lines.append(
+            "NOTE: neither dataset reports a non-zero volume, so the volume "
+            "comparison proves nothing."
+        )
+
+    if report.problems:
+        lines.append("Problems:")
+        lines.extend(f"  - {problem}" for problem in report.problems)
+
+    for difference in report.differences[:MAX_LISTED_GAPS]:
+        lines.append(
+            f"  {difference.timestamp:%Y-%m-%dT%H:%M:%SZ} {difference.field}:"
+            f" left {difference.left} vs right {difference.right}"
+            f" ({difference.relative_difference} relative)"
+        )
+
+    if report.differences_truncated:
+        lines.append("  ... further differences omitted")
+
+    for gap in report.gap_differences[:MAX_LISTED_GAPS]:
+        lines.append(
+            f"  gap in {gap.side} only {gap.start:%Y-%m-%dT%H:%M:%SZ}"
+            f" -> {gap.end:%Y-%m-%dT%H:%M:%SZ}"
+            f" ({gap.missing_candles} candles)"
+        )
+
+    lines.append(f"Verdict:           {report.status.value.upper()}")
+
+    if report.blocked:
+        lines.append(
+            "BLOCKED is not agreement and not a failure: there was nothing to "
+            "compare, so nothing has been verified."
+        )
+
+    return "\n".join(lines)
+
+
+def run_compare(args: argparse.Namespace) -> int:
+    thresholds = comparison_thresholds_from_args(args)
+
+    report = compare_datasets(
+        symbol=args.symbol,
+        timeframe=args.timeframe,
+        left_root=args.left,
+        right_root=args.right,
+        left_manifest_root=args.left_manifest_root,
+        right_manifest_root=args.right_manifest_root,
+        start=args.start,
+        end=args.end,
+        thresholds=thresholds,
+    )
+
+    record_path = None
+
+    if args.record_root:
+        record_path = ComparisonStore(args.record_root).save(
+            build_comparison_record(report, thresholds)
+        )
+
+    if args.as_json:
+        print(report.model_dump_json(indent=2))
+    else:
+        print(format_comparison(report))
+
+        if record_path is not None:
+            print(f"Record:            {record_path}")
+
+    return 0 if report.verified else 1
 
 
 def format_preflight(report: PreflightReport, *, live: bool) -> str:
@@ -900,6 +1216,9 @@ def main(
 
         if args.command == "validate":
             return run_validate(args)
+
+        if args.command == "compare":
+            return run_compare(args)
 
         if args.command == "provider-check":
             return run_provider_check(args, provider_factory=provider_factory)

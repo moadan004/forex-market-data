@@ -142,7 +142,7 @@ def schema_differences(schema: pa.Schema) -> list[str]:
     return differences
 
 
-def _partition_key(path: Path) -> tuple[int | None, int | None]:
+def partition_key(path: Path) -> tuple[int | None, int | None]:
     values = {
         piece.split("=", 1)[0]: piece.split("=", 1)[1]
         for piece in path.parts
@@ -164,7 +164,7 @@ def _inspect_partitions(
     partitions: list[PartitionInfo] = []
 
     for path in storage.partition_files(symbol=symbol, timeframe=timeframe):
-        year, month = _partition_key(path)
+        year, month = partition_key(path)
 
         # A file that cannot even be opened is a finding, not a crash.
         try:
@@ -207,7 +207,7 @@ def _read_dataset(
         return [], f"{type(exc).__name__}: {exc}"
 
 
-def _load_manifests(
+def load_manifests(
     manifest_root: Path,
     *,
     symbol: str,
@@ -342,7 +342,7 @@ def validate_dataset(
     cadence = timeframe_cadence(timeframe)
 
     manifests = (
-        _load_manifests(Path(manifest_root), symbol=symbol, timeframe=timeframe)
+        load_manifests(Path(manifest_root), symbol=symbol, timeframe=timeframe)
         if manifest_root is not None
         else []
     )
@@ -534,9 +534,12 @@ def _status(
 
 
 __all__ = [
+    "UNREADABLE_DATASET_ERRORS",
     "DatasetValidationReport",
     "ManifestCheck",
     "PartitionInfo",
+    "load_manifests",
+    "partition_key",
     "schema_differences",
     "validate_dataset",
 ]

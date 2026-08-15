@@ -47,7 +47,7 @@ diverge here:
 | 11 | API and UI | ⬜ |
 | 12 | Production | ⬜ |
 
-Test suite: **485 passing**. Ruff format and check: clean.
+Test suite: **586 passing**. Ruff format and check: clean.
 
 ---
 
@@ -258,7 +258,63 @@ remains is running them against a real acquired dataset, which Phase 5 gates.
 | Manifest agreement | claimed rows and files vs stored | ✅ | 🔴 |
 | Read-back validation | `ParquetStorage.read_table` / `read_candles` | ✅ | 🔴 |
 | Quality status classification | `quality/dataset.py` | ✅ | 🔴 |
-| Cross-provider validation | 🟡 a second provider exists (`csv`), no comparison tool yet | 🟡 | 🔴 |
+| Cross-provider comparison | `verification/comparison.py`, `marketdata compare` | ✅ | 🔴 |
+
+**Cross-provider comparison tool** — ✅ implemented and tested.
+`marketdata compare` and `compare_datasets()` judge two *stored* datasets
+against each other for the same symbol, timeframe and UTC range. It is not
+coupled to any provider: it reads Parquet, so any two datasets the pipeline
+produced can be compared, whoever produced them.
+
+It reports candles compared, matching and mismatching counts, candles present
+on only one side in each direction, duplicate timestamps, OHLC and volume
+disagreements with the largest observed difference and the timestamp it
+occurred at, the actual range each side covers, and gaps unique to either
+side. Tolerances are relative and expressed as `Decimal`; prices and volumes
+are never compared for exact equality. The verdict is PASS / WARN / FAIL /
+BLOCKED, with BLOCKED reserved for having nothing to compare.
+
+The comparison is read-only and works a month at a time, so comparing years
+of one-minute data holds one month of each side in memory rather than the
+whole history. It never reconciles a disagreement, never prefers one side,
+and never writes to either dataset.
+
+**Three distinct things, deliberately not conflated:**
+
+| Kind of verification | What it proves | Status |
+| --- | --- | --- |
+| Offline cross-provider comparison | two stored datasets agree, or exactly how they differ | ✅ implemented and tested |
+| Mocked provider testing | our client code handles the responses we *assume* a provider gives | ✅ for Dukascopy, via a mock transport |
+| Real Dukascopy verification | a real Dukascopy response was received and checked | 🔴 never achieved — see Current Blockers |
+
+Running `marketdata compare` between a CSV dataset and a Dukascopy dataset
+would be a real cross-provider verification. It has never been run, because
+no Dukascopy dataset exists: the comparison tool is offline-complete, and the
+Dukascopy side of it remains blocked by the egress policy.
+
+**Comparison records.** A comparison can be written to a durable record
+(`--record-root`) holding both provider identities and configurations, both
+dataset fingerprints, the symbol, timeframe, range, thresholds and the whole
+report. The record expires by itself: changing either dataset by a single
+byte, either provider configuration, the symbol, the timeframe, the range,
+the thresholds, or the record schema version all invalidate it. No credential
+is ever stored — a provider reports a key as `set` or `unset`, never by value.
+
+**Comparison thresholds and why they are what they are.** Documented on
+`ComparisonThresholds`, and configurable on the command line:
+
+| Threshold | Default | Reasoning |
+| --- | --- | --- |
+| `price_tolerance` | `0.0001` relative | About one pip on EUR/USD. Two feeds aggregate different liquidity and one may quote bid where another quotes mid, so a spread-sized difference is normal; a stale feed or a wrong scale factor is far larger. |
+| `volume_tolerance` | `0.05` relative | FX has no consolidated tape. "Volume" is a tick count over one provider's own feed, so two providers legitimately disagree. |
+| `price_mismatch_warn_ratio` / `fail_ratio` | `0.0` / `0.001` | One disagreeing candle in a month is noise; the same count in an hour is a broken feed, so the bound is a ratio of compared candles. |
+| `volume_mismatch_warn_ratio` / `fail_ratio` | `0.0` / `1.0` | A ratio cannot exceed 1, so the fail bound is unreachable by construction: volume differences are always reported and never fail. Lower it when comparing two feeds that genuinely should agree. |
+| `missing_warn_ratio` / `fail_ratio` | `0.0` / `0.01` | Reuses the acquisition defaults so one policy governs "how much missing data is tolerable" across the project. |
+
+These defaults are a **starting policy, not an empirical finding.** No real
+Dukascopy data has ever been observed, so the true disagreement between two
+live FX feeds is unmeasured here. Recalibrate from the first real
+cross-provider comparison and record the reasoning.
 
 **Dataset validation tool** — ✅ implemented and tested. `marketdata validate`
 and `validate_dataset()` inspect a stored dataset without contacting a
@@ -277,10 +333,13 @@ a pipeline.
 - ✅ A manifest that no longer matches what is stored is reported.
 - 🔴 Every reported missing interval on a real dataset is explained: a genuine
   provider gap, a market closure, or a holiday. Needs real data.
-- 🔴 A second provider agrees with Dukascopy on a sampled range, within a
-  documented tolerance. A second provider now exists, but comparing it with
-  Dukascopy needs real Dukascopy data, so this stays blocked; a comparison
-  tool between any two providers is buildable offline.
+- ✅ Any two stored datasets can be compared offline, within documented and
+  configurable tolerances, producing a durable record that expires when
+  anything it depended on changes.
+- 🔴 A second provider agrees with **Dukascopy** on a sampled range. The
+  comparison tool is built and tested, but one side of the comparison does
+  not exist: no Dukascopy dataset has ever been acquired. Blocked by the
+  egress policy, not by missing code.
 
 ---
 
@@ -498,6 +557,19 @@ nothing about Dukascopy, whose behaviour remains mock-tested only.
 - Quality reporting reads every stored timestamp in the requested range into
   memory — a few million values for seven years of one-minute data.
 - A chunk is retried whole; there is no partial-chunk recovery.
+- Cross-provider comparison matches gaps by exact interval equality, so two
+  partially overlapping gaps are reported as unique to each side rather than
+  as one shared gap that differs in length. The missing-candle counts, which
+  drive the verdict, are exact either way.
+- Comparison fingerprints hash every partition's bytes. That is deliberate —
+  a fingerprint that can miss a change is not evidence — but fingerprinting a
+  multi-year dataset is I/O bound.
+- Comparison assumes both datasets use this project's month-partitioned
+  layout. Comparing a dataset written by something else needs it converted
+  first.
+- A dataset's provider identity comes from the manifests beside it. With no
+  manifest root, both sides are compared as provider `unknown`, which is
+  honest but weaker evidence.
 
 ---
 
@@ -529,3 +601,15 @@ are retried with exponential backoff; permanent ones (400, 401, 403, other
 
 Do not begin milestone 4 or later until milestone 3 has actually succeeded
 against the live provider. Mocked integration tests are not a substitute.
+
+**Offline work that does not wait on milestone 3.** Cross-provider comparison
+(Phase 6) is complete and required no network. The comparison between a CSV
+dataset and a Dukascopy dataset — the actual cross-provider verification — is
+one command away and will run the moment a Dukascopy dataset exists:
+
+```bash
+marketdata compare \
+  --left  data/dukascopy/processed --left-manifest-root  data/dukascopy/manifests \
+  --right data/csv/processed       --right-manifest-root data/csv/manifests \
+  --symbol EUR/USD --timeframe 1min --record-root data/verification/comparisons
+```
