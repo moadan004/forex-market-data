@@ -36,6 +36,9 @@ data/
 *.parquet
 *.csv
 
+# Test fixtures are small, deterministic and belong in git.
+!tests/fixtures/**/*.csv
+
 # Logs
 logs/
 *.log

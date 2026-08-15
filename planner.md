@@ -47,7 +47,7 @@ diverge here:
 | 11 | API and UI | ⬜ |
 | 12 | Production | ⬜ |
 
-Test suite: **343 passing**. Ruff format and check: clean.
+Test suite: **402 passing**. Ruff format and check: clean.
 
 ---
 
@@ -86,7 +86,8 @@ abstraction that keeps vendor details out of everything downstream.
 | --- | --- | --- |
 | Canonical `Candle` model | ✅ | `models/candle.py` |
 | Provider interface | ✅ | `providers/base.py` |
-| Dukascopy provider | ✅ | `providers/dukascopy.py` |
+| Dukascopy provider | ✅ | `providers/dukascopy.py` — implemented, **mock-tested only** |
+| CSV provider (offline) | ✅ | `providers/csv.py` — implemented and tested offline against real files |
 | UTC normalization | ✅ | `normalization/timestamps.py` |
 | OHLC validation | ✅ | `validation/candles.py` |
 | Deduplication | ✅ | `validation/candles.py` |
@@ -94,8 +95,11 @@ abstraction that keeps vendor details out of everything downstream.
 **Acceptance criteria**
 
 - Candles are immutable, use `Decimal` prices, and reject naive datetimes.
-- A second provider can be added by implementing `MarketDataProvider` alone,
-  with no change downstream.
+- ✅ A second provider can be added by implementing `MarketDataProvider`
+  alone, with no change downstream. Demonstrated: `CsvMarketDataProvider`
+  drives the entire pipeline — chunking, checkpoints, resume, merging,
+  storage, manifests, validation and quality reporting — and the only
+  production change needed was a CLI switch to choose it.
 - Provider-specific logic (endpoints, pagination, payload shape, instrument
   identifiers) appears only under `providers/`.
 - Validation states the invariant it rejected, not just that it failed.
@@ -231,7 +235,7 @@ remains is running them against a real acquired dataset, which Phase 5 gates.
 | Manifest agreement | claimed rows and files vs stored | ✅ | 🔴 |
 | Read-back validation | `ParquetStorage.read_table` / `read_candles` | ✅ | 🔴 |
 | Quality status classification | `quality/dataset.py` | ✅ | 🔴 |
-| Cross-provider validation | ⬜ only one provider exists | ⬜ | ⬜ |
+| Cross-provider validation | 🟡 a second provider exists (`csv`), no comparison tool yet | 🟡 | 🔴 |
 
 **Dataset validation tool** — ✅ implemented and tested. `marketdata validate`
 and `validate_dataset()` inspect a stored dataset without contacting a
@@ -250,8 +254,10 @@ a pipeline.
 - ✅ A manifest that no longer matches what is stored is reported.
 - 🔴 Every reported missing interval on a real dataset is explained: a genuine
   provider gap, a market closure, or a holiday. Needs real data.
-- ⬜ A second provider agrees with Dukascopy on a sampled range, within a
-  documented tolerance.
+- 🔴 A second provider agrees with Dukascopy on a sampled range, within a
+  documented tolerance. A second provider now exists, but comparing it with
+  Dukascopy needs real Dukascopy data, so this stays blocked; a comparison
+  tool between any two providers is buildable offline.
 
 ---
 
@@ -434,6 +440,14 @@ blocker rather than missing code.
   not imported anywhere in `src/`. It is intended for configuration; drop it
   if configuration lands another way. (`tenacity` was in the same position
   and is now used by `providers/retry.py`.)
+
+### Offline coverage
+
+The ingestion path is exercised end to end without a network by the CSV
+provider, over deterministic fixtures holding duplicates, out-of-order rows,
+invalid OHLC relationships, out-of-range rows, gaps, several months,
+timezone offsets and malformed input. This proves the *pipeline*. It says
+nothing about Dukascopy, whose behaviour remains mock-tested only.
 
 ### Accepted limitations
 

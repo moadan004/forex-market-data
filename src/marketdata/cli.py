@@ -8,6 +8,7 @@ from marketdata.calendar import CALENDARS, get_calendar
 from marketdata.downloader.chunks import ChunkSize, parse_chunk_size
 from marketdata.downloader.pipeline import DownloadPipeline, DownloadResult
 from marketdata.providers.base import MarketDataProvider
+from marketdata.providers.csv import CsvMarketDataProvider
 from marketdata.providers.dukascopy import DukascopyProvider
 from marketdata.providers.errors import ProviderError
 from marketdata.providers.rate_limit import DEFAULT_REQUESTS_PER_SECOND, RateLimit
@@ -21,6 +22,8 @@ from marketdata.quality.dataset import DatasetValidationReport, validate_dataset
 from marketdata.quality.report import QualityStatus
 
 ProviderFactory = Callable[[], MarketDataProvider]
+
+PROVIDERS = ("dukascopy", "csv")
 
 MAX_LISTED_GAPS = 10
 
@@ -64,6 +67,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Download and process historical market data.",
     )
 
+    download.add_argument(
+        "--provider",
+        default="dukascopy",
+        choices=PROVIDERS,
+        help=(
+            "Where candles come from: dukascopy over the network, or csv "
+            "from local files. Default: dukascopy."
+        ),
+    )
+    download.add_argument(
+        "--source",
+        help=(
+            "Path to a CSV file or a directory of them. Required for "
+            "--provider csv, ignored otherwise."
+        ),
+    )
     download.add_argument(
         "--symbol",
         required=True,
@@ -420,6 +439,20 @@ def retry_policy_from_args(args: argparse.Namespace) -> RetryPolicy:
     )
 
 
+def provider_from_args(args: argparse.Namespace) -> MarketDataProvider:
+    """Build the provider the request asked for."""
+    if args.provider == "csv":
+        if not args.source:
+            raise ValueError("--source is required when --provider csv")
+
+        return CsvMarketDataProvider(args.source)
+
+    return DukascopyProvider(
+        retry_policy=retry_policy_from_args(args),
+        rate_limit=rate_limit_from_args(args),
+    )
+
+
 def run_download(
     args: argparse.Namespace,
     *,
@@ -428,10 +461,7 @@ def run_download(
     if provider_factory is None:
 
         def provider_factory() -> MarketDataProvider:
-            return DukascopyProvider(
-                retry_policy=retry_policy_from_args(args),
-                rate_limit=rate_limit_from_args(args),
-            )
+            return provider_from_args(args)
 
     provider = provider_factory()
 
