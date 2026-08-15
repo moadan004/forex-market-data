@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from marketdata.calendar import MarketCalendar
@@ -27,7 +27,11 @@ from marketdata.quality.report import (
     build_quality_report,
     write_quality_report,
 )
-from marketdata.storage.manifest import create_manifest, write_manifest
+from marketdata.storage.manifest import (
+    DatasetProvenance,
+    create_manifest,
+    write_manifest,
+)
 from marketdata.storage.parquet import ParquetStorage, normalize_symbol_path
 from marketdata.validation.candles import (
     CandleValidationError,
@@ -115,6 +119,8 @@ class DownloadPipeline:
         calendar: MarketCalendar | None = None,
         chunk_size: ChunkSize | None = None,
         strict: bool = False,
+        verification: str | None = None,
+        unverified_override: bool = False,
     ) -> None:
         self.provider = provider
         self.storage = ParquetStorage(output_root)
@@ -124,6 +130,10 @@ class DownloadPipeline:
         self.calendar = calendar or ForexCalendar()
         self.chunk_size = chunk_size or MonthlyChunkSize()
         self.strict = strict
+        # Recorded in provenance so a dataset carries the evidence it was
+        # acquired under, including the absence of it.
+        self.verification = verification
+        self.unverified_override = unverified_override
 
     def run(
         self,
@@ -348,6 +358,30 @@ class DownloadPipeline:
         directory = normalize_symbol_path(symbol)
         quality_path = self.quality_root / directory / f"{slug}.json"
 
+        provenance = DatasetProvenance(
+            provider=self.provider.name,
+            provider_configuration=self.provider.configuration(),
+            symbol=symbol,
+            timeframe=timeframe,
+            requested_start=start,
+            requested_end=end,
+            actual_start=report.actual_start,
+            actual_end=report.actual_end,
+            rows=report.retained_rows,
+            quality_status=report.status.value,
+            calendar=self.calendar.name,
+            chunk_size=self.chunk_size.label,
+            rate_limit=rate_limit.describe() if rate_limit else None,
+            retry=(
+                retry_policy.describe()
+                if (retry_policy := getattr(self.provider, "retry_policy", None))
+                else None
+            ),
+            acquired_at=datetime.now(UTC),
+            verification=self.verification,
+            unverified_override=self.unverified_override,
+        )
+
         manifest = create_manifest(
             symbol=symbol,
             timeframe=timeframe,
@@ -362,6 +396,7 @@ class DownloadPipeline:
             quality_report=quality_path,
             quality_status=report.status.value,
             checkpoint=checkpoint_path,
+            provenance=provenance,
         )
 
         manifest_path = write_manifest(

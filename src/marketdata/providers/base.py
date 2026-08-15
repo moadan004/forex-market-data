@@ -34,3 +34,16 @@ class MarketDataProvider(ABC):
     def health_check(self) -> bool:
         """Return True when the provider is reachable and usable."""
         raise NotImplementedError
+
+    def configuration(self) -> dict[str, str]:
+        """
+        Describe the settings that shape what this provider returns.
+
+        Recorded in dataset provenance and used to invalidate a verification
+        that was made against a different setup. Implementations must never
+        include credentials: report that a key is set, never what it is.
+
+        Optional — the default describes nothing, so a provider stays a
+        four-method contract.
+        """
+        return {}

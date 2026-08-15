@@ -338,6 +338,18 @@ class DukascopyProvider(MarketDataProvider):
             key=lambda candle: candle.timestamp,
         )
 
+    def configuration(self) -> dict[str, str]:
+        """Describe the request settings, never the credential itself."""
+        return {
+            "base_url": self.base_url,
+            "timeout_seconds": str(self._timeout),
+            "api_key": "set" if self.api_key else "unset",
+            "retry_attempts": str(self.retry_policy.attempts),
+            "retry_backoff_seconds": str(self.retry_policy.backoff_seconds),
+            "retry_max_backoff_seconds": str(self.retry_policy.max_backoff_seconds),
+            "rate_limit_requests_per_second": str(self.rate_limit.requests_per_second),
+        }
+
     def health_check(self) -> bool:
         try:
             self._request(
