@@ -63,7 +63,8 @@ src/marketdata/
 │   ├── errors.py         Transient vs permanent failure classification
 │   ├── retry.py          Retry policy and executor
 │   ├── rate_limit.py     Outbound request pacing
-│   └── dukascopy.py      Dukascopy implementation
+│   ├── dukascopy.py      Dukascopy implementation (network)
+│   └── csv.py            Local CSV implementation (offline)
 ├── normalization/
 │   └── timestamps.py     UTC normalization
 ├── validation/
@@ -82,10 +83,86 @@ src/marketdata/
 └── cli.py                Command-line entry point
 ```
 
+## Providers
+
 Provider-specific concerns — endpoints, pagination, payload shape, symbol
-identifiers — stay inside `providers/`. Everything downstream works on
-`Candle` objects, so a second provider can be added by implementing
-`MarketDataProvider` alone.
+identifiers, file layout — stay inside `providers/`. Everything downstream
+works on `Candle` objects, so a provider is added by implementing
+`MarketDataProvider` alone: `name`, `get_supported_symbols`, `fetch_candles`
+and `health_check`.
+
+Two implementations ship, and the pipeline cannot tell them apart:
+
+| Provider | `--provider` | Source | Network |
+| --- | --- | --- | --- |
+| `DukascopyProvider` | `dukascopy` (default) | Dukascopy HTTP API | required |
+| `CsvMarketDataProvider` | `csv` | local files | never |
+
+Retries and rate limiting are provider capabilities, not pipeline
+requirements: the pipeline asks a provider whether it has them rather than
+assuming. A CSV run reports `Rate limit: none` because a local file needs
+no pacing.
+
+### The CSV provider
+
+`CsvMarketDataProvider` reads candles from local CSV, which makes the whole
+ingestion path — chunking, checkpoints, resume, merging, storage, manifests,
+validation and quality reporting — exercisable with no network at all.
+
+**Schema.** `timestamp,open,high,low,close` are required; `volume` and
+`symbol` are optional.
+
+```csv
+timestamp,open,high,low,close,volume
+2026-08-10T00:00:00Z,1.17000,1.17020,1.16990,1.17005,100
+2026-08-10T00:01:00Z,1.17001,1.17021,1.16991,1.17006,101
+```
+
+- `timestamp` — ISO-8601 **with an offset**. `Z` and `+03:00` are both
+  accepted and normalized to UTC through the same path as any other
+  provider. A naive timestamp is rejected, not guessed at.
+- `open`, `high`, `low`, `close`, `volume` — decimal numbers, read as
+  `Decimal` so no precision is lost on the way in. `volume` defaults to `0`
+  when the column is absent.
+- `symbol` — optional. With it, one file can hold several instruments and
+  rows are selected by symbol. Without it, the file serves whatever symbol
+  is requested of it.
+
+**Source layout.** The source is a single file, or a directory searched by
+symbol and timeframe:
+
+```text
+<source>/EUR_USD_1min.csv
+<source>/EUR_USD.csv
+```
+
+**What it does not do.** It returns what the file holds, restricted to the
+requested range. Duplicates, gaps and rows breaking an OHLC invariant are
+passed on for the pipeline to judge — a provider that quietly repaired its
+input would hide the very defects the quality report exists to surface.
+Nothing is interpolated or invented. A malformed row stops the read, naming
+the file, line and field, rather than being skipped: silently dropping rows
+would turn a broken file into a dataset with an unexplained gap.
+
+**Offline example.**
+
+```bash
+uv run marketdata download \
+  --provider csv \
+  --source tests/fixtures/csv/dataset \
+  --symbol EUR/USD \
+  --start 2026-08-10T00:00:00Z \
+  --end 2026-08-10T02:00:00Z \
+  --chunk-size 30min
+
+uv run marketdata validate --symbol EUR/USD --calendar 24x7
+```
+
+> **This is not live-provider verification.** Exercising the pipeline against
+> CSV proves the pipeline, not Dukascopy. No request has ever reached
+> Dukascopy from this environment, and the provider's live behaviour —
+> response shape, pagination, rate limits, history depth — remains
+> unconfirmed.
 
 ## Session-calendar awareness
 
@@ -269,7 +346,9 @@ UTC. The range is half-open: `--end` is exclusive.
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `--timeframe` | `1min` | Dukascopy timeframe |
+| `--provider` | `dukascopy` | `dukascopy` (network) or `csv` (local files) |
+| `--source` | — | CSV file or directory; required for `--provider csv` |
+| `--timeframe` | `1min` | Timeframe to request |
 | `--chunk-size` | `1month` | Size of each provider request: `1month`, `3months`, `2w`, `7d`, `12h`, `30min` |
 | `--calendar` | `forex` | Trading calendar: `forex` or `24x7` |
 | `--no-resume` | off | Ignore saved progress and download every chunk again |
