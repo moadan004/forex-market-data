@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from bisect import insort
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -467,23 +468,73 @@ def partition_batches(
     ]
 
 
+class _BoundedSamples:
+    """
+    Keep the lowest-ranked samples of an unbounded stream, and count it all.
+
+    Two datasets that disagree everywhere produce a gap per candle, so
+    collecting every difference and truncating afterwards makes the report
+    largest for exactly the comparison least able to afford it. This holds
+    ``limit`` samples no matter how many arrive.
+
+    The retained samples are the ones a full sort would have put first, so
+    the report is identical to one built by sorting everything and slicing —
+    it is only the memory that changes. ``limit`` is small, so keeping the
+    buffer ordered by insertion costs less than a heap would.
+    """
+
+    def __init__(self, limit: int, key) -> None:
+        self.limit = limit
+        self.total = 0
+
+        self._key = key
+        self._sequence = 0
+        self._ranked: list[tuple[object, int, object]] = []
+
+    def add(self, sample) -> None:
+        self.total += 1
+        rank = (self._key(sample), self._sequence, sample)
+        self._sequence += 1
+
+        if len(self._ranked) < self.limit:
+            insort(self._ranked, rank, key=lambda entry: entry[:2])
+            return
+
+        if rank[:2] < self._ranked[-1][:2]:
+            insort(self._ranked, rank, key=lambda entry: entry[:2])
+            self._ranked.pop()
+
+    @property
+    def samples(self) -> list:
+        """The retained samples, lowest-ranked first."""
+        return [sample for _, _, sample in self._ranked]
+
+    @property
+    def truncated(self) -> bool:
+        """Whether more samples arrived than are being reported."""
+        return self.total > len(self._ranked)
+
+
 class _GapTracker:
     """
     Find gaps in a stream of partitions without holding the whole stream.
 
     Each batch is joined to the previous one by carrying its last timestamp
     forward, so a gap spanning a month boundary is found exactly as an
-    interior one is.
+    interior one is. Only the batch's own gaps are returned; the caller
+    resolves them immediately rather than accumulating a list that grows
+    with the dataset.
     """
 
     def __init__(self, cadence) -> None:
         self.cadence = cadence
         self.last: datetime | None = None
-        self.gaps: list[MissingInterval] = []
+        self.count = 0
 
-    def feed(self, stamps: list[datetime]) -> None:
+    def feed(self, stamps: list[datetime]) -> list[MissingInterval]:
+        """Return the gaps this batch closed, in chronological order."""
         if self.cadence is None:
-            return
+            return []
 
         ordered = sorted(set(stamps))
 
@@ -491,10 +542,13 @@ class _GapTracker:
             ordered = [self.last, *ordered]
 
         if not ordered:
-            return
+            return []
 
-        self.gaps.extend(find_missing_intervals(ordered, self.cadence))
+        found = find_missing_intervals(ordered, self.cadence)
         self.last = ordered[-1]
+        self.count += len(found)
+
+        return found
 
 
 class _Tally:
@@ -525,6 +579,51 @@ class _Tally:
         self.right_end: datetime | None = None
         self.left_gaps = _GapTracker(cadence)
         self.right_gaps = _GapTracker(cadence)
+        self.gaps_only_left = 0
+        self.gaps_only_right = 0
+        self.gap_samples = _BoundedSamples(
+            MAX_VIOLATION_SAMPLES,
+            key=lambda gap: (gap.start, gap.side),
+        )
+
+    def note_gaps(
+        self,
+        left: list[MissingInterval],
+        right: list[MissingInterval],
+    ) -> None:
+        """
+        Record the gaps one batch found on only one of the two sides.
+
+        Resolvable a batch at a time because a gap is closed by the
+        timestamp that ends it: two sides holding the identical gap hold the
+        identical closing timestamp, which falls in the same month and so is
+        read in the same batch. Nothing about a gap therefore has to be
+        carried past the batch that found it.
+        """
+        left_keys = {(gap.start, gap.end) for gap in left}
+        right_keys = {(gap.start, gap.end) for gap in right}
+
+        for side, found, other in (
+            ("left", left, right_keys),
+            ("right", right, left_keys),
+        ):
+            for gap in found:
+                if (gap.start, gap.end) in other:
+                    continue
+
+                if side == "left":
+                    self.gaps_only_left += 1
+                else:
+                    self.gaps_only_right += 1
+
+                self.gap_samples.add(
+                    GapDifference(
+                        side=side,
+                        start=gap.start,
+                        end=gap.end,
+                        missing_candles=gap.missing_candles,
+                    )
+                )
 
     def note_range(self, side: str, stamps: list[datetime]) -> None:
         if not stamps:
@@ -762,8 +861,10 @@ def compare_datasets(
         tally.note_range("left", list(left_by_time))
         tally.note_range("right", list(right_by_time))
 
-        tally.left_gaps.feed(list(left_by_time))
-        tally.right_gaps.feed(list(right_by_time))
+        tally.note_gaps(
+            tally.left_gaps.feed(list(left_by_time)),
+            tally.right_gaps.feed(list(right_by_time)),
+        )
 
         for timestamp in sorted(left_by_time.keys() & right_by_time.keys()):
             _compare_candle(
@@ -797,40 +898,6 @@ def compare_datasets(
         tally=tally,
         read_errors=read_errors,
         partitions=len(batches),
-    )
-
-
-def _gap_differences(tally: _Tally) -> tuple[list[GapDifference], int, int]:
-    """Return the gaps present on one side only, in chronological order."""
-    left_keys = {(gap.start, gap.end) for gap in tally.left_gaps.gaps}
-    right_keys = {(gap.start, gap.end) for gap in tally.right_gaps.gaps}
-
-    unique = [
-        GapDifference(
-            side="left",
-            start=gap.start,
-            end=gap.end,
-            missing_candles=gap.missing_candles,
-        )
-        for gap in tally.left_gaps.gaps
-        if (gap.start, gap.end) not in right_keys
-    ] + [
-        GapDifference(
-            side="right",
-            start=gap.start,
-            end=gap.end,
-            missing_candles=gap.missing_candles,
-        )
-        for gap in tally.right_gaps.gaps
-        if (gap.start, gap.end) not in left_keys
-    ]
-
-    only_left = sum(1 for gap in unique if gap.side == "left")
-
-    return (
-        sorted(unique, key=lambda gap: (gap.start, gap.side)),
-        only_left,
-        len(unique) - only_left,
     )
 
 
@@ -955,8 +1022,6 @@ def _finish(
             f"right {_stamp(tally.right_start)} -> {_stamp(tally.right_end)}"
         )
 
-    gap_differences, only_left, only_right = _gap_differences(tally)
-
     return ComparisonReport(
         symbol=symbol,
         timeframe=timeframe,
@@ -988,12 +1053,12 @@ def _finish(
         max_volume_difference_at=tally.max_volume_difference_at,
         differences=tally.differences,
         differences_truncated=tally.difference_count > len(tally.differences),
-        gaps_left=len(tally.left_gaps.gaps),
-        gaps_right=len(tally.right_gaps.gaps),
-        gap_differences=gap_differences[:MAX_VIOLATION_SAMPLES],
-        gap_differences_truncated=len(gap_differences) > MAX_VIOLATION_SAMPLES,
-        gaps_only_left=only_left,
-        gaps_only_right=only_right,
+        gaps_left=tally.left_gaps.count,
+        gaps_right=tally.right_gaps.count,
+        gap_differences=tally.gap_samples.samples,
+        gap_differences_truncated=tally.gap_samples.truncated,
+        gaps_only_left=tally.gaps_only_left,
+        gaps_only_right=tally.gaps_only_right,
         partitions_compared=partitions,
         thresholds=thresholds.configuration(),
         thresholds_description=thresholds.describe(),

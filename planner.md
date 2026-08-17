@@ -47,7 +47,7 @@ diverge here:
 | 11 | API and UI | ⬜ |
 | 12 | Production | ⬜ |
 
-Test suite: **636 passing**. Ruff format and check: clean.
+Test suite: **671 passing**. Ruff format and check: clean.
 
 ---
 
@@ -261,6 +261,7 @@ remains is running them against a real acquired dataset, which Phase 5 gates.
 | Scales to the target dataset | bounded by partition, not dataset, size | ✅ | 🔴 |
 | Quality status classification | `quality/dataset.py` | ✅ | 🔴 |
 | Cross-provider comparison | `verification/comparison.py`, `marketdata compare` | ✅ | 🔴 |
+| Comparison scales to the target dataset | partition-bounded reads, capped gap samples | ✅ | 🔴 |
 
 **Memory-bounded validation and quality reporting** — ✅ implemented and
 tested. Both paths now walk a dataset one partition at a time. A partition is
@@ -320,6 +321,23 @@ The comparison is read-only and works a month at a time, so comparing years
 of one-minute data holds one month of each side in memory rather than the
 whole history. It never reconciles a disagreement, never prefers one side,
 and never writes to either dataset.
+
+**Gap differences are bounded as well.** Two feeds that disagree everywhere
+produce a gap per candle, so gaps are resolved and counted in the batch that
+found them and fed into a capped sample buffer, rather than accumulated and
+truncated afterwards — the pattern that made the report largest for exactly
+the comparison least able to afford it. Resolving per batch is exact because
+a gap is closed by a timestamp: two sides holding the identical gap hold the
+identical closing timestamp, which falls in the same month and so is read in
+the same batch.
+
+`gaps_left`, `gaps_right`, `gaps_only_left` and `gaps_only_right` stay exact
+however many gaps exist; `gap_differences` retains at most twenty — the same
+ones a full sort would have put first — and `gap_differences_truncated`, plus
+a line in the human-readable output, says when there were more. The whole
+report was diffed field-for-field against the pre-change implementation for a
+small disagreement and for a 724-gap one spanning six partitions: identical
+in both. This is a scaling property, not a fixed RAM figure.
 
 **Three distinct things, deliberately not conflated:**
 
@@ -381,6 +399,10 @@ a pipeline.
 - ✅ Validating a dataset does not require holding it. Memory is bounded by
   partition size, so the checks above can run against the multi-year target
   dataset and not only against fixtures.
+- ✅ Comparing two datasets does not require holding their disagreements
+  either. Gap samples are capped while the counts stay exact, so a comparison
+  of two badly diverging multi-year datasets no longer produces a report that
+  grows with the divergence.
 - 🔴 A second provider agrees with **Dukascopy** on a sampled range. The
   comparison tool is built and tested, but one side of the comparison does
   not exist: no Dukascopy dataset has ever been acquired. Blocked by the
@@ -616,6 +638,10 @@ nothing about Dukascopy, whose behaviour remains mock-tested only.
   partially overlapping gaps are reported as unique to each side rather than
   as one shared gap that differs in length. The missing-candle counts, which
   drive the verdict, are exact either way.
+- A comparison report retains at most twenty gap differences and twenty field
+  differences. The counts beside them are exact and the truncation is
+  reported, but a report of a large disagreement is a summary of it, not a
+  full listing.
 - Comparison fingerprints hash every partition's bytes. That is deliberate —
   a fingerprint that can miss a change is not evidence — but fingerprinting a
   multi-year dataset is I/O bound.

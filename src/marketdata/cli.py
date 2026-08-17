@@ -868,6 +868,17 @@ def format_comparison(report: ComparisonReport) -> str:
             f" ({gap.missing_candles} candles)"
         )
 
+    listed = min(len(report.gap_differences), MAX_LISTED_GAPS)
+    total_gap_differences = report.gaps_only_left + report.gaps_only_right
+
+    if total_gap_differences > listed:
+        # The counts above are exact; only the listing is abridged, and
+        # saying so is cheaper than leaving a reader to subtract.
+        lines.append(
+            f"  ... and {total_gap_differences - listed} further one-sided gaps"
+            " not listed"
+        )
+
     lines.append(f"Verdict:           {report.status.value.upper()}")
 
     if report.blocked:

@@ -536,6 +536,24 @@ counted and located, and what to do about it is a human decision.
 comparing years of one-minute data holds one month of each side rather than
 the whole history. A gap spanning a partition boundary is still found.
 
+**Gap samples are bounded too.** Two feeds that disagree everywhere produce a
+gap per candle, so gap differences are collected into a capped buffer rather
+than accumulated and truncated afterwards — which would have made the report
+largest for exactly the comparison least able to afford it. A gap is resolved
+in the batch that found it: two sides holding the identical gap hold the
+identical closing timestamp, which falls in the same month, so nothing about a
+gap has to be carried past its own batch.
+
+`gaps_left`, `gaps_right`, `gaps_only_left` and `gaps_only_right` stay
+**exact** however many gaps exist. `gap_differences` retains at most
+`MAX_VIOLATION_SAMPLES` (20) — the same ones a full sort would have put first
+— and `gap_differences_truncated` says when there were more. The human-readable
+output says so as well, naming how many one-sided gaps went unlisted. Nothing
+is silently dropped: only the listing is abridged, never a count.
+
+This is a scaling property, not a fixed RAM figure. The comparison still holds
+one month of each dataset while it works.
+
 **Damage is a finding, not a crash.** A corrupt partition, a missing file or
 an incompatible schema is reported by path and fails the comparison; no raw
 PyArrow error escapes.
@@ -823,6 +841,11 @@ the quality report, Parquet round-tripping, cross-provider comparison over two
 independent CSV feeds acquired through the real pipeline, and the CLI end to
 end for fresh, failed and resumed runs.
 
+Bounded gap collection in comparison is held to the same standard: the
+collector is instrumented so a test fails if more than the sample limit is
+ever resident, and the whole report is diffed against the pre-change
+implementation for both a small and a large multi-partition disagreement.
+
 Streaming validation is held to two separate promises. That it is bounded is
 tested deterministically rather than by measuring process memory: the
 partition reader is instrumented, the whole-range reads are replaced with
@@ -900,6 +923,9 @@ For every stored dataset:
 - **Cross-provider comparison has never been run against Dukascopy.** The tool
   is complete and tested offline, but one side of the comparison — a real
   Dukascopy dataset — does not exist.
+- Comparison retains at most 20 gap differences and 20 field differences. The
+  counts beside them are exact, and the truncation is reported, but a report
+  is a summary of a large disagreement rather than a full listing of it.
 - `compare` matches gaps by exact interval equality, so two partially
   overlapping gaps are reported as unique to each side rather than as one
   shared gap of different length. The missing-candle counts that drive the
