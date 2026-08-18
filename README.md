@@ -222,6 +222,20 @@ progress is dropped rather than trusted. Checkpoints are written through a
 temporary file and renamed into place, since a download is interrupted
 precisely when something goes wrong.
 
+**A checkpoint is reconciled against the stored data before anything is
+skipped.** It records what a run did, which is not the same question as what
+is on disk now: between two runs a partition can be deleted, lost to a failed
+copy, or corrupted. A chunk the checkpoint calls complete is re-acquired when
+the partitions covering it no longer hold readable rows, and the summary says
+how many chunks that was. Without this, a lost partition was invisible to the
+download path — the run reported `already done`, exited `0`, and left a hole
+that only `marketdata validate` would ever find.
+
+The check reads Parquet footers, not rows, so it costs a metadata read per
+partition on a multi-year resume. A chunk that legitimately stored zero rows
+stays complete: a window the market was closed for has nothing to re-fetch,
+and re-downloading it on every run would be worse than useless.
+
 By default a failing chunk is recorded and the run continues, so one bad
 window does not abandon the rest of a multi-year range; the command exits `1`
 and lists the failed chunks. `--strict` stops at the first failure instead.
@@ -918,6 +932,15 @@ For every stored dataset:
   retries are exhausted is re-fetched from its start on the next run.
 - The rate limit is per process. Two downloads started separately do not
   share a limiter, so running several at once multiplies the request rate.
+- A corrupt partition stops a download with a raw PyArrow message and no
+  manifest is written for that run. `marketdata validate` names the file;
+  deleting it and re-running re-acquires the month.
+- A permanent provider failure does not stop the run: the remaining chunks
+  are still attempted and fail the same way. Recoverable by resuming, but a
+  long acquisition spends requests on it.
+- Candles stored inside market-closed periods are counted but never
+  challenged. `expected_rows` and `retained_rows` are both reported; nothing
+  compares them, so a dataset can exceed its expectation and still read `ok`.
 - Pacing is uniform: there is no adaptive slowdown that lowers the rate after
   a provider signals overload beyond honouring `Retry-After` on that request.
 - **Cross-provider comparison has never been run against Dukascopy.** The tool

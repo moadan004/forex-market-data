@@ -8,6 +8,7 @@ from marketdata.calendar import MarketCalendar
 from marketdata.calendar.forex import ForexCalendar
 from marketdata.downloader.checkpoint import (
     CheckpointStore,
+    ChunkCheckpoint,
     DownloadCheckpoint,
     mark_completed,
     mark_failed,
@@ -80,6 +81,14 @@ class DownloadResult:
     chunks_completed: int
     chunks_failed: int
     chunks_skipped: int
+    chunks_repaired: list[int]
+    """Chunks the checkpoint called complete whose data was no longer stored.
+
+    Re-acquired rather than skipped. A non-empty list means the dataset had
+    lost a partition since the run that wrote it — worth seeing, because
+    nothing else in the run would have said so.
+    """
+
     retries: int
     files_written: list[Path]
     rate_limit: str
@@ -163,11 +172,29 @@ class DownloadPipeline:
             resume=resume,
         )
 
+        # Decided before any chunk runs, and never during the loop: chunks
+        # share a partition, so a chunk that rewrites one would otherwise
+        # convince the chunks after it that their own lost rows were back.
+        stored = {
+            chunk.index: self._already_stored(
+                chunk,
+                checkpoint.record(chunk.index),
+                symbol=symbol,
+                timeframe=timeframe,
+            )
+            for chunk in chunks
+        }
+
         outcomes: list[ChunkOutcome] = []
         skipped = 0
+        repaired = [
+            chunk.index
+            for chunk in chunks
+            if checkpoint.record(chunk.index).is_complete and not stored[chunk.index]
+        ]
 
         for chunk in chunks:
-            if checkpoint.record(chunk.index).is_complete:
+            if stored[chunk.index]:
                 skipped += 1
                 continue
 
@@ -191,6 +218,42 @@ class DownloadPipeline:
             checkpoint=checkpoint,
             checkpoint_path=checkpoint_path,
             skipped=skipped,
+            repaired=repaired,
+        )
+
+    def _already_stored(
+        self,
+        chunk: Chunk,
+        record: ChunkCheckpoint,
+        *,
+        symbol: str,
+        timeframe: str,
+    ) -> bool:
+        """
+        Decide whether a chunk can be skipped on a resumed run.
+
+        A checkpoint records what a run *did*, which is not the same as what
+        is on disk now. Between two runs a partition can be deleted, lost to
+        a failed copy, or corrupted, and trusting the checkpoint alone would
+        skip the chunk and report a clean run over a hole — the exact
+        outcome this project refuses to call success.
+
+        So the checkpoint is reconciled against the data every time. A chunk
+        that stored nothing stays complete: a window the market was closed
+        for legitimately has no rows, and re-downloading it forever would be
+        worse than useless.
+        """
+        if not record.is_complete:
+            return False
+
+        if record.row_count == 0:
+            return True
+
+        return self.storage.has_stored_rows(
+            symbol=symbol,
+            timeframe=timeframe,
+            start=chunk.start,
+            end=chunk.end,
         )
 
     def _run_chunk(
@@ -303,6 +366,7 @@ class DownloadPipeline:
         checkpoint: DownloadCheckpoint,
         checkpoint_path: Path,
         skipped: int,
+        repaired: list[int],
     ) -> DownloadResult:
         # The report describes what is on disk for the requested range, so a
         # resumed run reports the whole dataset and not only its own chunks.
@@ -425,6 +489,7 @@ class DownloadPipeline:
             chunks_completed=report.chunks_completed,
             chunks_failed=report.chunks_failed,
             chunks_skipped=skipped,
+            chunks_repaired=repaired,
             retries=sum(outcome.retries for outcome in outcomes),
             files_written=written,
             rate_limit=rate_limit.describe() if rate_limit else "none",

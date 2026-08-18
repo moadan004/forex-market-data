@@ -670,6 +670,12 @@ def format_summary(result: DownloadResult) -> str:
     if report.expected_rows is not None:
         lines.append(f"Expected rows:     {report.expected_rows}")
 
+    if result.chunks_repaired:
+        lines.append(
+            f"Re-acquired:       {len(result.chunks_repaired)} chunks whose stored "
+            "data had gone missing since the run that wrote them"
+        )
+
     lines.append(f"Parquet files:     {len(result.files)}")
     lines.extend(f"  - {path}" for path in result.files)
     lines.append(f"Manifest:          {result.manifest}")

@@ -25,10 +25,15 @@ diverge here:
 
 | Term | Meaning |
 | --- | --- |
-| Implemented and tested | code exists and is covered by the suite |
-| Tested with mocks | provider behaviour exercised through a mock HTTP transport, never against Dukascopy |
-| Verified against real Dukascopy | a real response was received and checked — **nothing carries this yet** |
-| Blocked by environment | cannot be attempted from here; the egress policy denies the host |
+| Implemented + unit tested | code exists and its units are covered by the suite |
+| Implemented + offline integration tested | exercised end to end through the production path against local fixtures, no network |
+| Mock verified | provider behaviour exercised through a mock HTTP transport, never against Dukascopy |
+| Real provider verified | a real Dukascopy response was received and checked — **nothing carries this yet** |
+| Environment blocked | cannot be attempted from here; the egress policy denies the host |
+
+These are deliberately five levels rather than "tested / not tested". The
+ingestion path is at *offline integration tested*; the Dukascopy provider is
+at *mock verified*; nothing anywhere is at *real provider verified*.
 
 ## Status at a glance
 
@@ -47,7 +52,7 @@ diverge here:
 | 11 | API and UI | ⬜ |
 | 12 | Production | ⬜ |
 
-Test suite: **671 passing**. Ruff format and check: clean.
+Test suite: **683 passing**. Ruff format and check: clean.
 
 ---
 
@@ -221,8 +226,11 @@ verification.
   historical download is refused without all three.
 - ✅ Verification means re-inspecting the stored dataset, not a zero exit
   code.
-- ✅ An override exists, is explicit, and is recorded in the data's
-  provenance.
+- 🟡 An override exists and is explicit. It is recorded in the data's
+  provenance on the `marketdata download` path; `verify-stage` does not pass
+  `verification` or `unverified_override` into the pipeline, so a stage run
+  under `--force-unverified` leaves no trace of that in the dataset's
+  provenance. The verification record itself still carries the outcome.
 - Each stage's quality report has status `ok`, or every deviation is
   explained and accepted before proceeding.
 - Chunk sizing and runtime are recorded at stage 4 and used to estimate
@@ -556,6 +564,96 @@ a pipeline.
 
 ---
 
+## Production-readiness audit
+
+Performed against `e723c69` to answer one question: *if this repository were
+moved to a network-permitted environment tomorrow, could it safely acquire
+and validate 5–7 years of one-minute data without changing the
+implementation?*
+
+The whole acquisition path was traced in the code and exercised offline
+through the production pipeline against a synthetic three-month, 131,039-row
+CSV feed spanning three partitions.
+
+### What the audit confirmed works
+
+| Property | Evidence |
+| --- | --- |
+| Staged guard refuses an unverified multi-month range | a 3-month `download` was refused until smoke, daily and monthly were verified |
+| Resume re-fetches only what is missing | one failed chunk of three; the resumed run asked the provider for that chunk alone |
+| Repeat runs are idempotent | a third run made zero provider requests and left the Parquet byte-identical |
+| A killed process recovers | a chunk left `running` was re-run and introduced no duplicates |
+| Manifests track the stored dataset, not the run | a narrow re-run over fuller data still produced an agreeing manifest |
+| A changed provider configuration invalidates verification | pointing the CSV provider at another source re-blocked the historical download |
+| Validation memory is flat in dataset size | 1 / 6 / 12 months → 299 / 336 / 344 MiB peak RSS for 44k / 262k / 527k candles |
+| A policy denial cannot become a verification | a 403 on every chunk produced a `blocked` record that the guard refuses, no Parquet, and an honest zero-row manifest |
+
+### The defect it found
+
+**A completed chunk whose stored data had gone was skipped, and the run
+reported success over the hole.** The checkpoint was the only authority on
+whether a chunk was done; nothing reconciled it against the files. Deleting
+one partition of a three-month dataset and re-running produced
+`3/3 completed, 0 failed, 3 already done`, exit code 0, and a dataset missing
+30,000 candles. Recovery required `--no-resume`, i.e. re-downloading the
+entire request, because deleting the file alone changed nothing.
+
+For a multi-day, 84-partition acquisition this was the difference between a
+resumable run and a silently incomplete one. Fixed on
+`claude/checkpoint-data-reconciliation`: the checkpoint is now reconciled
+against the stored data before any chunk is skipped, from Parquet footers
+only, and re-acquired chunks are reported. A chunk that legitimately stored
+zero rows stays complete, so a closed market is not re-downloaded forever.
+
+### Findings accepted rather than fixed
+
+- **A corrupt partition still stops the run with a raw PyArrow message.**
+  `_finish` reads every partition in range to build the quality report, so an
+  unreadable file raises out of `pipeline.run()` and no manifest is written.
+  With the reconciliation fix the recovery is one step — `validate` names the
+  file, delete it, re-run, and the month is re-acquired — where before the
+  fix deleting it accomplished nothing. Worth its own milestone: a truthful
+  quality report for a partially unreadable dataset is a design question, not
+  a patch.
+- **A permanent, run-wide provider failure does not stop the run.** A 403 on
+  the first chunk does not prevent the remaining chunks from being attempted;
+  each fails the same way. Bounded and recoverable, but 84 futile requests on
+  a seven-year run. `--strict` stops on the first failure but also stops on a
+  single invalid candle, which is too blunt for a long acquisition.
+- **Candles inside market-closed periods are never challenged.** The calendar
+  is used to excuse gaps but never to question unexpected rows. A 24×7 feed
+  validated against the forex calendar stored 527,040 rows against 374,160
+  expected — 41% excess — and reported `ok` with no problems. Both numbers are
+  in the report; nothing compares them.
+- **`live` in a verification record means "no stub transport was injected",
+  not "real network I/O happened".** `verify-stage --provider csv` writes
+  `live: true`. It cannot create false evidence about Dukascopy — records are
+  keyed by provider and configuration fingerprint — but the field does not
+  mean what its name suggests.
+- **`ChunkCheckpoint.files` stores absolute paths**, so it does not survive a
+  moved dataset. Nothing reads it today; the reconciliation deliberately asks
+  storage instead.
+- **No disk-space preflight.** Seven years of one-minute data is roughly
+  100 MB per symbol as stored, so this is a small risk, but nothing checks.
+- **A very large `--chunk-size` is unguarded.** One chunk is held in memory
+  several times over during ingestion; `12months` of one-minute data would be
+  hundreds of MB. The `1month` default is safe.
+
+### Readiness verdict
+
+| Scale | Ready? | Reason |
+| --- | --- | --- |
+| 1 day | 🔴 environment only | Machinery proven offline; needs one real Dukascopy response |
+| 1 month | 🔴 environment only | Same; multi-chunk, multi-partition behaviour proven offline |
+| 1 year | 🔴 environment only | Same; memory and resume behaviour measured and flat |
+| 5–7 years | 🔴 environment only | Same, with the checkpoint reconciliation fix merged |
+
+No scale is blocked by missing code once the reconciliation fix lands. Every
+scale is blocked by the same thing: not one real Dukascopy candle has ever
+been received.
+
+---
+
 ## Current Blockers
 
 ### Environment blockers
@@ -577,11 +675,13 @@ a pipeline.
 
 ### Implementation blockers
 
-**None.** The ingestion path is feature-complete for large-scale acquisition:
-chunked, resumable, merging safely, retrying transient failures with bounded
-backoff, and pacing every request including retries. What remains before
-Phase 5 is verification against the live provider, which is an environment
-blocker rather than missing code.
+**None outstanding.** One was found by the production-readiness audit and is
+fixed on `claude/checkpoint-data-reconciliation`; see *Production-readiness
+audit* below. The ingestion path is otherwise feature-complete for
+large-scale acquisition: chunked, resumable, merging safely, retrying
+transient failures with bounded backoff, and pacing every request including
+retries. What remains before Phase 5 is verification against the live
+provider, which is an environment blocker rather than missing code.
 
 ### Known inconsistencies
 

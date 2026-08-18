@@ -296,6 +296,39 @@ class ParquetStorage:
 
         return sorted(groups.items())
 
+    def has_stored_rows(
+        self,
+        *,
+        symbol: str,
+        timeframe: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> bool:
+        """
+        Return whether readable rows are still stored for a range.
+
+        Answers from Parquet footers alone, so asking it once per chunk of a
+        multi-year acquisition costs a metadata read per partition and no
+        rows. A file that has gone, or that can no longer be opened, counts
+        as holding nothing: both are indistinguishable to every reader here.
+
+        The granularity is the partition, because that is the granularity
+        data is lost at — a partition file is rewritten whole or not at all.
+        """
+        for path in self.partition_files(
+            symbol=symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+        ):
+            try:
+                if pq.read_metadata(path).num_rows > 0:
+                    return True
+            except UNREADABLE_STORAGE_ERRORS:
+                continue
+
+        return False
+
     def read_partition(
         self,
         path: str | Path,
