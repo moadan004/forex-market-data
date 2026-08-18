@@ -599,11 +599,22 @@ one partition of a three-month dataset and re-running produced
 entire request, because deleting the file alone changed nothing.
 
 For a multi-day, 84-partition acquisition this was the difference between a
-resumable run and a silently incomplete one. Fixed on
-`claude/checkpoint-data-reconciliation`: the checkpoint is now reconciled
-against the stored data before any chunk is skipped, from Parquet footers
-only, and re-acquired chunks are reported. A chunk that legitimately stored
-zero rows stays complete, so a closed market is not re-downloaded forever.
+resumable run and a silently incomplete one. Fixed in `a7d70d4`, now on
+`main`: the checkpoint is reconciled against the stored data before any chunk
+is skipped, from Parquet footers only, and re-acquired chunks are reported. A
+chunk that legitimately stored zero rows stays complete, so a closed market is
+not re-downloaded forever.
+
+Re-verified end to end on the consolidated `main`: a complete three-partition
+dataset had one partition deleted while its checkpoint still read
+`['completed', 'completed', 'completed']`; the resumed run reported
+`2 already done` plus `Re-acquired: 1 chunks`, restored the partition
+**byte-identically**, and validated with zero duplicates and every manifest
+agreeing. A third run downloaded nothing and left the partition mtimes
+untouched. With six one-hour chunks sharing a single month partition, deleting
+that partition re-acquired **all six** — the regression found during
+implementation, where a chunk rewriting a shared partition convinced the
+chunks after it that their own lost rows were back.
 
 ### Findings accepted rather than fixed
 
@@ -646,11 +657,10 @@ zero rows stays complete, so a closed market is not re-downloaded forever.
 | 1 day | 🔴 environment only | Machinery proven offline; needs one real Dukascopy response |
 | 1 month | 🔴 environment only | Same; multi-chunk, multi-partition behaviour proven offline |
 | 1 year | 🔴 environment only | Same; memory and resume behaviour measured and flat |
-| 5–7 years | 🔴 environment only | Same, with the checkpoint reconciliation fix merged |
+| 5–7 years | 🔴 environment only | Same; the checkpoint reconciliation fix is merged |
 
-No scale is blocked by missing code once the reconciliation fix lands. Every
-scale is blocked by the same thing: not one real Dukascopy candle has ever
-been received.
+No scale is blocked by missing code. Every scale is blocked by the same
+thing: not one real Dukascopy candle has ever been received.
 
 ---
 
@@ -676,8 +686,8 @@ been received.
 ### Implementation blockers
 
 **None outstanding.** One was found by the production-readiness audit and is
-fixed on `claude/checkpoint-data-reconciliation`; see *Production-readiness
-audit* below. The ingestion path is otherwise feature-complete for
+fixed in `a7d70d4`, merged to `main`; see *Production-readiness audit*
+below. The ingestion path is otherwise feature-complete for
 large-scale acquisition: chunked, resumable, merging safely, retrying
 transient failures with bounded backoff, and pacing every request including
 retries. What remains before Phase 5 is verification against the live
@@ -692,8 +702,9 @@ provider, which is an environment blocker rather than missing code.
 
 ### Live status
 
-One `provider-check` was attempted against the real Dukascopy endpoint on
-the current branch. It returned:
+Two `provider-check` attempts have been made against the real Dukascopy
+endpoint, the most recent from the consolidated `main` at `a7d70d4` after the
+checkpoint reconciliation fix landed. Both returned the same thing:
 
 ```text
 BLOCKED  reachable: refused by policy or credentials:
